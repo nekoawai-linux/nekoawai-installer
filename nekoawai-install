@@ -1,0 +1,1004 @@
+#!/bin/bash
+# NekoAwai installer.
+#
+# Puts the base system on a UEFI machine: partitions, filesystems, the base
+# pattern, the bootloader. Anything beyond that list is configured in the
+# installed system, not here.
+
+set -Eeuo pipefail
+
+# The installer reads the output of parted, zypper and cryptsetup, and the
+# Live console carries no font beyond the built-in one. A single locale for
+# the whole run keeps both the log and the screen readable whatever the
+# environment asks for.
+export LC_ALL=C.UTF-8
+
+TARGET=/mnt
+ESP_SIZE=512MiB
+VERSION=0.2.0
+INSTALL_LOG=/tmp/nekoawai-install.log
+
+# Where the nekoawai-* packages live on the installation medium. Until
+# there is a public build, they come from here.
+: "${NEKO_TARGET_REPO:=${NEKO_LOCAL_REPO:-/run/nekoawai/repo}}"
+: "${NEKO_CORE_REPO:=http://download.opensuse.org/tumbleweed/repo/oss/}"
+: "${NEKO_DETECT_GPU:=yes}"
+
+DISK=
+ESP_PART=
+ROOT_PART=
+ROOT_DEV=
+ROOT_UUID=
+ROOT_PART_UUID=
+ESP_UUID=
+FSTYPE=
+ENCRYPT=no
+HOSTNAME=
+LOCALE=
+KEYMAP=
+TIMEZONE=
+PROFILE=minimal
+DESKTOP=
+SWAP_MODE=zram
+SWAP_SIZE=4G
+NETWORK_MODE=automatic
+ENABLE_SSH=no
+ADDITIONAL_PACKAGES=
+ROOT_LOCKED=no
+ROOT_PASSWORD=
+LUKS_PASSPHRASE=
+TUI=no
+GPU_PACKAGES=
+
+declare -a USER_NAMES=()
+declare -a USER_PASSWORDS=()
+declare -a USER_WHEEL=()
+
+# In a terminal the step heading comes from run_step, and printing both
+# leaves every step named twice.
+log() { [ "$TUI" = yes ] || printf '\n>>> %s\n' "$*"; }
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+
+ask() {
+	local prompt=$1 default=${2:-} answer
+	read -r -p "$prompt${default:+ [$default]}: " answer
+	printf '%s' "${answer:-$default}"
+}
+
+ask_secret() {
+	local prompt=$1 first second
+	# Everything but the answer goes to stderr: the caller reads the value
+	# through command substitution, so anything on stdout would end up
+	# inside the password.
+	while :; do
+		read -r -s -p "$prompt: " first; echo >&2
+		read -r -s -p "repeat: " second; echo >&2
+		if [ -n "$first" ] && [ "$first" = "$second" ]; then
+			break
+		fi
+		echo "empty or does not match" >&2
+	done
+	printf '%s' "$first"
+}
+
+# The screens are drawn here rather than handed to a widget library: the
+# Live console has the built-in font and nothing else, and a full-screen
+# list reads the same on it as it does in a terminal emulator.
+TUI_BRAND=$'\033[1;35m'
+TUI_DIM=$'\033[2m'
+TUI_SELECTED=$'\033[7m'
+TUI_PLAIN=$'\033[0m'
+
+tui_screen() {
+	printf '\033[2J\033[H%sNekoAwai Installer %s%s\n\n' \
+		"$TUI_BRAND" "$VERSION" "$TUI_PLAIN"
+	[ -z "${1:-}" ] || printf '%s\n\n' "$1"
+}
+
+# Arrow keys arrive as three bytes, Enter as an empty read; anything the
+# menu does not understand leaves the selection where it was.
+tui_key() {
+	local key tail
+	KEY=other
+	IFS= read -rsn1 key || { KEY=escape; return; }
+	case $key in
+	'') KEY=enter ;;
+	k) KEY=up ;;
+	j) KEY=down ;;
+	$'\033')
+		IFS= read -rsn2 -t 0.05 tail || tail=
+		case $tail in
+		'[A') KEY=up ;;
+		'[B') KEY=down ;;
+		'') KEY=escape ;;
+		esac
+		;;
+	esac
+}
+
+# Tag and label pairs, as dialog took them; the chosen tag lands in REPLY.
+# Leaving with Esc returns non-zero and REPLY keeps its previous value, so a
+# cancelled submenu changes no setting.
+tui_menu() {
+	local caption=$1 index=0 last width=0 position
+	shift
+	local -a tags=() labels=()
+	while [ "$#" -gt 1 ]; do
+		tags+=("$1")
+		labels+=("$2")
+		shift 2
+	done
+	last=$(( ${#tags[@]} - 1 ))
+	for position in "${!labels[@]}"; do
+		[ "${#labels[$position]}" -le "$width" ] || width=${#labels[$position]}
+	done
+
+	while :; do
+		tui_screen "$caption"
+		for position in "${!tags[@]}"; do
+			if [ "$position" -eq "$index" ]; then
+				printf '%s > %-*s %s\n' \
+					"$TUI_SELECTED" "$width" "${labels[$position]}" "$TUI_PLAIN"
+			else
+				printf '   %-*s \n' "$width" "${labels[$position]}"
+			fi
+		done
+		printf '\n%sup/down choose, enter confirm, esc back%s\n' \
+			"$TUI_DIM" "$TUI_PLAIN"
+
+		tui_key
+		case $KEY in
+		up) [ "$index" -gt 0 ] && index=$(( index - 1 )) || index=$last ;;
+		down) [ "$index" -lt "$last" ] && index=$(( index + 1 )) || index=0 ;;
+		enter) REPLY=${tags[$index]}; return 0 ;;
+		escape) return 1 ;;
+		esac
+	done
+}
+
+# The safe answer comes first unless the caller asks otherwise.
+tui_confirm() {
+	if [ "${2:-no}" = yes ]; then
+		tui_menu "$1" yes "Yes" no "No" || return 1
+	else
+		tui_menu "$1" no "No" yes "Yes" || return 1
+	fi
+	[ "$REPLY" = yes ]
+}
+
+tui_message() {
+	tui_screen "$1"
+	printf '%spress enter to continue%s' "$TUI_DIM" "$TUI_PLAIN"
+	read -r _ || :
+}
+
+tui_input() {
+	local title=$1 prompt=$2 default=${3:-}
+	tui_screen "$title"
+	printf '\033[?25h'
+	read -r -p "$prompt${default:+ [$default]}: " REPLY || REPLY=
+	printf '\033[?25l'
+	[ -n "$REPLY" ] || REPLY=$default
+}
+
+tui_password() {
+	local title=$1 first second
+	while :; do
+		tui_screen "$title"
+		read -r -s -p "Password: " first; echo
+		read -r -s -p "Repeat: " second; echo
+		if [ -n "$first" ] && [ "$first" = "$second" ]; then
+			REPLY=$first
+			return 0
+		fi
+		tui_message "Passwords are empty or do not match."
+	done
+}
+
+select_disk_tui() {
+	local line
+	local -a items=()
+	while IFS= read -r line; do
+		items+=("${line%% *}" "$line")
+	done < <(lsblk -dnpo NAME,SIZE,MODEL -e 7,11)
+
+	[ "${#items[@]}" -gt 0 ] || { tui_message "No installation disks found."; return; }
+	if tui_menu "Select a disk. It is erased only after the confirmation." \
+		"${items[@]}"; then
+		DISK=$REPLY
+	fi
+}
+
+select_profile_tui() {
+	if ! tui_menu "System type" \
+		minimal "Minimal CLI system" \
+		desktop "Graphical system"; then
+		return
+	fi
+	PROFILE=$REPLY
+	if [ "$PROFILE" = minimal ]; then
+		DESKTOP=
+		return
+	fi
+	if tui_menu "Choose one desktop" \
+		niri "Niri" \
+		hyprland "Hyprland" \
+		gnome "GNOME" \
+		plasma "KDE Plasma" \
+		xfce "Xfce"; then
+		DESKTOP=$REPLY
+	fi
+}
+
+select_storage_tui() {
+	if tui_menu "Root filesystem" ext4 "ext4" btrfs "btrfs with an @ subvolume"; then
+		FSTYPE=$REPLY
+	fi
+	if tui_confirm "Encrypt the root partition with LUKS2?"; then
+		ENCRYPT=yes
+		if tui_password "LUKS2 passphrase"; then
+			LUKS_PASSPHRASE=$REPLY
+		else
+			ENCRYPT=no
+			LUKS_PASSPHRASE=
+		fi
+	else
+		ENCRYPT=no
+		LUKS_PASSPHRASE=
+	fi
+}
+
+select_swap_tui() {
+	if ! tui_menu "Swap mode" \
+		zram "Compressed swap in RAM" \
+		swapfile "Swap file on the root filesystem" \
+		none "No swap"; then
+		return
+	fi
+	SWAP_MODE=$REPLY
+	if [ "$SWAP_MODE" = swapfile ] && \
+		tui_input "Swap file" "Size: a number with an M or G suffix" "$SWAP_SIZE"; then
+		SWAP_SIZE=$REPLY
+	fi
+}
+
+configure_identity_tui() {
+	if tui_input "Machine name" "Hostname" "${HOSTNAME:-nekoawai}"; then HOSTNAME=$REPLY; fi
+	if tui_input "Locale" "System locale" "${LOCALE:-en_US.UTF-8}"; then LOCALE=$REPLY; fi
+	if tui_input "Keyboard" "Console keymap" "${KEYMAP:-us}"; then KEYMAP=$REPLY; fi
+	if tui_input "Time zone" "Timezone, for example Europe/Samara" "${TIMEZONE:-UTC}"; then TIMEZONE=$REPLY; fi
+}
+
+add_user_tui() {
+	local name wheel=no existing
+	if ! tui_input "New user" "User name"; then return; fi
+	name=$REPLY
+	if ! [[ $name =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+		tui_message "Invalid user name: $name"
+		return
+	fi
+	for existing in "${USER_NAMES[@]}"; do
+		[ "$existing" != "$name" ] || { tui_message "User $name is already on the list."; return; }
+	done
+	if ! tui_password "Password for $name"; then return; fi
+	local password=$REPLY
+	if tui_confirm "Add $name to the wheel group?" yes; then
+		wheel=yes
+	fi
+	USER_NAMES+=("$name")
+	USER_PASSWORDS+=("$password")
+	USER_WHEEL+=("$wheel")
+}
+
+delete_user_tui() {
+	local index
+	local -a items=()
+	for index in "${!USER_NAMES[@]}"; do
+		if [ "${USER_WHEEL[$index]}" = yes ]; then
+			items+=("$index" "${USER_NAMES[$index]} (wheel)")
+		else
+			items+=("$index" "${USER_NAMES[$index]}")
+		fi
+	done
+	[ "${#items[@]}" -gt 0 ] || { tui_message "There are no users to delete."; return; }
+	if tui_menu "Select a user to delete" "${items[@]}"; then
+		index=$REPLY
+		unset 'USER_NAMES[index]' 'USER_PASSWORDS[index]' 'USER_WHEEL[index]'
+		USER_NAMES=("${USER_NAMES[@]}")
+		USER_PASSWORDS=("${USER_PASSWORDS[@]}")
+		USER_WHEEL=("${USER_WHEEL[@]}")
+	fi
+}
+
+configure_users_tui() {
+	local choice root_state
+	while :; do
+		if [ "$ROOT_LOCKED" = yes ]; then
+			root_state=locked
+		elif [ -n "$ROOT_PASSWORD" ]; then
+			root_state=set
+		else
+			root_state="not set"
+		fi
+		if ! tui_menu "Root: $root_state, regular users: ${#USER_NAMES[@]}" \
+			root-password "Set the root password" \
+			root-lock "Lock the root account" \
+			add "Add a user" \
+			delete "Delete a user" \
+			back "Back"; then
+			return
+		fi
+		choice=$REPLY
+		case $choice in
+		root-password)
+			if tui_password "Root"; then ROOT_PASSWORD=$REPLY; ROOT_LOCKED=no; fi
+			;;
+		root-lock) ROOT_PASSWORD=; ROOT_LOCKED=yes ;;
+		add) add_user_tui ;;
+		delete) delete_user_tui ;;
+		back) return ;;
+		esac
+	done
+}
+
+configure_network_tui() {
+	if ! tui_menu "Networking in the installed system" \
+		automatic "NetworkManager with automatic DHCP" \
+		copy "Copy the connections of the Live system" \
+		nmtui "Open nmtui, then copy the connections"; then
+		return
+	fi
+	NETWORK_MODE=$REPLY
+	if [ "$NETWORK_MODE" = nmtui ]; then
+		nmtui
+		NETWORK_MODE=copy
+	fi
+}
+
+configure_packages_tui() {
+	if tui_input "Additional packages" \
+		"Exact package names separated by spaces. Leave empty if there are none." \
+		"$ADDITIONAL_PACKAGES"; then
+		ADDITIONAL_PACKAGES=$REPLY
+	fi
+}
+
+toggle_ssh_tui() {
+	if [ "$ENABLE_SSH" = yes ]; then ENABLE_SSH=no; else ENABLE_SSH=yes; fi
+}
+
+configuration_summary() {
+	local users_text=none name swap_text=$SWAP_MODE
+	if [ "${#USER_NAMES[@]}" -gt 0 ]; then
+		users_text=
+		for name in "${USER_NAMES[@]}"; do users_text="${users_text:+$users_text, }$name"; done
+	fi
+	[ "$SWAP_MODE" = swapfile ] && swap_text="swapfile ($SWAP_SIZE)"
+	cat <<-EOF
+		Disk:        ${DISK:-not selected}
+		Filesystem:  $FSTYPE
+		Encryption:  $ENCRYPT
+		Profile:     ${DESKTOP:-$PROFILE}
+		Swap:        $swap_text
+		Hostname:    ${HOSTNAME:-not set}
+		Locale:      ${LOCALE:-not set}
+		Keymap:      ${KEYMAP:-not set}
+		Timezone:    ${TIMEZONE:-not set}
+		Users:       $users_text
+		Root locked: $ROOT_LOCKED
+		Network:     $NETWORK_MODE
+		SSH:         $ENABLE_SSH
+		Packages:    ${ADDITIONAL_PACKAGES:-none}
+	EOF
+}
+
+package_available() {
+	local wanted=$1 rpm
+	for rpm in "$NEKO_TARGET_REPO"/*.rpm; do
+		[ -e "$rpm" ] || break
+		[ "$(rpm -qp --qf '%{NAME}' "$rpm" 2>/dev/null)" != "$wanted" ] || return 0
+	done
+	zypper --non-interactive --no-refresh --xmlout search --match-exact \
+		--type package "$wanted" 2>/dev/null | grep -q "name=\"$wanted\""
+}
+
+validate_configuration() {
+	local name package has_admin=no profile_package=patterns-nekoawai-base
+	VALIDATION_ERROR=
+	[ -n "$DISK" ] && [ -b "$DISK" ] || VALIDATION_ERROR="Select an installation disk."
+	if [ -n "$DISK" ] && lsblk -nrpo MOUNTPOINT "$DISK" | grep -q '[^[:space:]]'; then
+		VALIDATION_ERROR="There are mounted filesystems on $DISK."
+	fi
+	case $FSTYPE in
+	ext4 | btrfs) ;;
+	*) VALIDATION_ERROR="Select a filesystem: ext4 or btrfs." ;;
+	esac
+	[ "$PROFILE" != desktop ] || [ -n "$DESKTOP" ] || VALIDATION_ERROR="Select a desktop."
+	[ "$PROFILE" != desktop ] || profile_package="patterns-nekoawai-$DESKTOP"
+	if [ -n "$DESKTOP" ] || [ "$PROFILE" = minimal ]; then
+		package_available "$profile_package" || VALIDATION_ERROR="Profile not found in the repositories: $profile_package"
+	fi
+	[ "$ENCRYPT" != yes ] || [ -n "$LUKS_PASSPHRASE" ] || VALIDATION_ERROR="Set the LUKS2 passphrase."
+	[[ ${HOSTNAME:-} =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] || VALIDATION_ERROR="Invalid hostname."
+	[ -n "$LOCALE" ] || VALIDATION_ERROR="Set the locale."
+	[ -n "$KEYMAP" ] || VALIDATION_ERROR="Set the console keymap."
+	[ -f "/usr/share/zoneinfo/${TIMEZONE:-}" ] || VALIDATION_ERROR="Unknown time zone: ${TIMEZONE:-empty}."
+	[ "$SWAP_MODE" != swapfile ] || [[ $SWAP_SIZE =~ ^[1-9][0-9]*[MG]$ ]] || \
+		VALIDATION_ERROR="The swap file size has to look like 4096M or 4G."
+
+	for name in "${USER_WHEEL[@]}"; do [ "$name" != yes ] || has_admin=yes; done
+	if [ "$PROFILE" = desktop ] && [ "${#USER_NAMES[@]}" -eq 0 ]; then
+		VALIDATION_ERROR="A desktop needs at least one regular user."
+	fi
+	if [ "$ENABLE_SSH" = yes ] && [ "$has_admin" != yes ]; then
+		VALIDATION_ERROR="SSH needs a user in the wheel group."
+	fi
+	if [ "$ROOT_LOCKED" != yes ] && [ -z "$ROOT_PASSWORD" ]; then
+		VALIDATION_ERROR="Set the root password or lock the root account."
+	fi
+	if [ "$ROOT_LOCKED" = yes ] && [ "${#USER_NAMES[@]}" -eq 0 ]; then
+		VALIDATION_ERROR="Root cannot be locked without a regular user."
+	fi
+
+	for package in $ADDITIONAL_PACKAGES; do
+		if ! [[ $package =~ ^[A-Za-z0-9@._+:-]+$ ]]; then
+			VALIDATION_ERROR="Invalid package name: $package"
+			break
+		fi
+		if ! package_available "$package"; then
+			VALIDATION_ERROR="Package not found in the enabled repositories: $package"
+			break
+		fi
+	done
+
+	[ -z "$VALIDATION_ERROR" ]
+}
+
+confirm_install_tui() {
+	if ! validate_configuration; then
+		tui_message "$VALIDATION_ERROR"
+		return 1
+	fi
+	tui_menu "$(configuration_summary)" \
+		back "Back to the menu" \
+		continue "Continue" || return 1
+	[ "$REPLY" = continue ] || return 1
+
+	tui_menu "ALL DATA ON $DISK WILL BE DESTROYED." \
+		back "Cancel" \
+		wipe "Erase $DISK and install" || return 1
+	[ "$REPLY" = wipe ]
+}
+
+# Menu rows carry a name and the value currently set for it.
+tui_row() { printf '%-16s %s' "$1" "$2"; }
+
+configure_tui() {
+	local choice root_text
+	HOSTNAME=${HOSTNAME:-nekoawai}
+	LOCALE=${LOCALE:-en_US.UTF-8}
+	KEYMAP=${KEYMAP:-us}
+	TIMEZONE=${TIMEZONE:-UTC}
+
+	# The menus hide the cursor, and a shell left without one looks broken.
+	trap 'printf "\033[?25h"' EXIT
+	printf '\033[?25l'
+
+	while :; do
+		if [ "$ROOT_LOCKED" = yes ]; then root_text=locked; elif [ -n "$ROOT_PASSWORD" ]; then root_text=set; else root_text="not set"; fi
+		if ! tui_menu "Configure the system, then choose Install." \
+			disk "$(tui_row Disk "${DISK:-not selected}")" \
+			storage "$(tui_row Storage "${FSTYPE:-not selected}, LUKS2 $ENCRYPT")" \
+			profile "$(tui_row Profile "${DESKTOP:-$PROFILE}")" \
+			swap "$(tui_row Swap "$SWAP_MODE")" \
+			identity "$(tui_row System "$HOSTNAME, $LOCALE, $TIMEZONE")" \
+			users "$(tui_row Users "${#USER_NAMES[@]}, root $root_text")" \
+			network "$(tui_row Network "$NETWORK_MODE")" \
+			ssh "$(tui_row SSH "$ENABLE_SSH")" \
+			packages "$(tui_row Packages "${ADDITIONAL_PACKAGES:-none}")" \
+			install "Install" \
+			quit "Quit"; then
+			die "installation cancelled"
+		fi
+		choice=$REPLY
+		case $choice in
+		disk) select_disk_tui ;;
+		storage) select_storage_tui ;;
+		profile) select_profile_tui ;;
+		swap) select_swap_tui ;;
+		identity) configure_identity_tui ;;
+		users) configure_users_tui ;;
+		network) configure_network_tui ;;
+		ssh) toggle_ssh_tui ;;
+		packages) configure_packages_tui ;;
+		install) confirm_install_tui && break ;;
+		quit) die "installation cancelled" ;;
+		esac
+	done
+
+	printf '\033[?25h'
+}
+
+partition_path() {
+	local disk=$1 number=$2
+	# nvme0n1 -> nvme0n1p1, sda -> sda1
+	case $disk in
+	*[0-9]) printf '%sp%s' "$disk" "$number" ;;
+	*) printf '%s%s' "$disk" "$number" ;;
+	esac
+}
+
+require_uefi_root() {
+	[ "$(id -u)" -eq 0 ] || die "root privileges are required"
+	[ -d /sys/firmware/efi ] || die "0.0.1 installs on UEFI machines only"
+}
+
+select_disk() {
+	log "available disks"
+	lsblk -dno NAME,SIZE,MODEL -e 7,11
+	DISK=/dev/$(ask "disk to install on (without /dev/)")
+	[ -b "$DISK" ] || die "$DISK is not a block device"
+}
+
+select_layout() {
+	FSTYPE=$(ask "root filesystem (ext4/btrfs)" ext4)
+	case $FSTYPE in
+	ext4 | btrfs) ;;
+	*) die "0.0.1 supports ext4 and btrfs only" ;;
+	esac
+	ENCRYPT=$(ask "encrypt the root with LUKS2 (yes/no)" no)
+}
+
+confirm_wipe() {
+	log "ALL DATA ON $DISK WILL BE DESTROYED"
+	[ "$(ask "type yes to continue")" = yes ] || die "cancelled"
+}
+
+partition_disk() {
+	log "partitioning $DISK"
+	wipefs -a "$DISK"
+	parted -s "$DISK" mklabel gpt
+	parted -s "$DISK" mkpart ESP fat32 1MiB "$ESP_SIZE"
+	parted -s "$DISK" set 1 esp on
+	parted -s "$DISK" mkpart root "$ESP_SIZE" 100%
+	udevadm settle
+
+	ESP_PART=$(partition_path "$DISK" 1)
+	ROOT_PART=$(partition_path "$DISK" 2)
+
+	# A fresh partition table does not erase what lies inside the partitions.
+	# A reinstall puts them back at the same offsets, and mkfs and luksFormat
+	# both stop at the signature of the previous system found there.
+	wipefs -a "$ESP_PART" "$ROOT_PART"
+}
+
+open_encrypted_root() {
+	[ "$ENCRYPT" = yes ] || { ROOT_DEV=$ROOT_PART; return; }
+
+	log "encrypting the root"
+	local passphrase=$LUKS_PASSPHRASE
+	[ -n "$passphrase" ] || passphrase=$(ask_secret "LUKS2 passphrase")
+	printf '%s' "$passphrase" | cryptsetup luksFormat --type luks2 --batch-mode "$ROOT_PART" -
+	printf '%s' "$passphrase" | cryptsetup open "$ROOT_PART" cr_root -
+	passphrase=
+	LUKS_PASSPHRASE=
+	ROOT_DEV=/dev/mapper/cr_root
+}
+
+format_filesystems() {
+	log "creating filesystems"
+	mkfs.vfat -F32 -n EFI "$ESP_PART"
+	case $FSTYPE in
+	ext4) mkfs.ext4 -q -L nekoawai "$ROOT_DEV" ;;
+	btrfs) mkfs.btrfs -q -L nekoawai "$ROOT_DEV" ;;
+	esac
+}
+
+mount_target() {
+	log "mounting $TARGET"
+	if [ "$FSTYPE" = btrfs ]; then
+		# The @ subvolume leaves room for root snapshots without a
+		# reinstall.
+		mount "$ROOT_DEV" "$TARGET"
+		btrfs subvolume create "$TARGET/@" >/dev/null
+		umount "$TARGET"
+		mount -o subvol=@ "$ROOT_DEV" "$TARGET"
+	else
+		mount "$ROOT_DEV" "$TARGET"
+	fi
+	mkdir -p "$TARGET/boot/efi"
+	# Same permissions fstab will use: otherwise the bootloader drops its
+	# random seed onto a world-readable partition and complains.
+	mount -o umask=0077 "$ESP_PART" "$TARGET/boot/efi"
+
+	ROOT_UUID=$(blkid -s UUID -o value "$ROOT_DEV")
+	ROOT_PART_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+	ESP_UUID=$(blkid -s UUID -o value "$ESP_PART")
+}
+
+detect_gpu_packages() {
+	local device class vendor package packages=" "
+	[ "$PROFILE" = desktop ] && [ "$NEKO_DETECT_GPU" = yes ] || return 0
+	for device in /sys/bus/pci/devices/*; do
+		[ -r "$device/class" ] && [ -r "$device/vendor" ] || continue
+		read -r class < "$device/class"
+		[[ $class = 0x03* ]] || continue
+		read -r vendor < "$device/vendor"
+		case $vendor in
+		0x8086) package=libvulkan_intel ;;
+		0x1002) package=libvulkan_radeon ;;
+		0x10de) package=libvulkan_nouveau ;;
+		*) continue ;;
+		esac
+		case $packages in *" $package "*) ;; *) packages="$packages$package " ;; esac
+	done
+	GPU_PACKAGES=${packages# }
+	GPU_PACKAGES=${GPU_PACKAGES% }
+}
+
+normalize_gpu_packages() {
+	local package
+	local selected=" $GPU_PACKAGES "
+	local -a remove=()
+	# Nothing recognised means a virtual machine or a card we do not know
+	# yet, and there the profile knows better than this function. Pruning on
+	# an empty detection took Mesa off the target, and the desktop with it.
+	[ -n "$GPU_PACKAGES" ] || return 0
+	for package in libvulkan_intel libvulkan_radeon libvulkan_nouveau; do
+		case $selected in
+		*" $package "*) continue ;;
+		esac
+		rpm --root "$TARGET" -q "$package" >/dev/null 2>&1 && remove+=("$package")
+	done
+	[ "${#remove[@]}" -gt 0 ] || return 0
+	# The drivers share their dependencies with the rest of Mesa, so cleaning
+	# up after them removes far more than the driver.
+	zypper --root "$TARGET" --non-interactive remove "${remove[@]}"
+}
+
+install_base() {
+	log "installing the base system"
+	local pattern=patterns-nekoawai-base
+	local -a install_args=()
+	[ "$PROFILE" != desktop ] || pattern="patterns-nekoawai-$DESKTOP"
+	read -r -a install_args <<< "$ADDITIONAL_PACKAGES $GPU_PACKAGES"
+	# Bootstrap repositories exist for the duration of the install only; in
+	# the finished system repositories belong to nekoawai-repos.
+	zypper --root "$TARGET" --non-interactive --gpg-auto-import-keys \
+		addrepo --refresh "$NEKO_CORE_REPO" nekoawai-bootstrap
+	if [ -d "$NEKO_TARGET_REPO" ]; then
+		zypper --root "$TARGET" --non-interactive \
+			addrepo --no-gpgcheck --priority 90 "dir:$NEKO_TARGET_REPO" nekoawai-local
+	fi
+
+	if [ "$PROFILE" = desktop ]; then
+		zypper --root "$TARGET" --non-interactive --gpg-auto-import-keys \
+			install "$pattern" "${install_args[@]}"
+	else
+		zypper --root "$TARGET" --non-interactive --gpg-auto-import-keys \
+			install --no-recommends "$pattern" "${install_args[@]}"
+	fi
+	normalize_gpu_packages
+
+	zypper --root "$TARGET" --non-interactive removerepo nekoawai-bootstrap
+	if [ -d "$NEKO_TARGET_REPO" ]; then
+		zypper --root "$TARGET" --non-interactive removerepo nekoawai-local
+	fi
+	zypper --root "$TARGET" --non-interactive clean --all
+}
+
+keep_own_packages() {
+	log "distribution packages in the system"
+	# Without a repository of their own the nekoawai-* packages are orphans
+	# and the first `zypper dup` removes them; see nekoawai-repos.
+	[ -d "$NEKO_TARGET_REPO" ] || return 0
+	install -dm 0755 "$TARGET/var/lib/nekoawai/repo"
+	cp -p "$NEKO_TARGET_REPO"/*.rpm "$TARGET/var/lib/nekoawai/repo/"
+}
+
+apply_service_policy() {
+	log "service policy"
+	local display_manager
+	# A preset takes effect in %post of the package that brought the unit,
+	# and systemd, getty and dbus-broker arrive in the same transaction as
+	# nekoawai-systemd-presets, usually before it. So apply the policy
+	# separately, to the whole root at once.
+	systemctl --root="$TARGET" preset-all
+	if [ "$PROFILE" = desktop ]; then
+		case $DESKTOP in
+		niri | xfce) display_manager=lightdm.service ;;
+		hyprland | plasma) display_manager=sddm.service ;;
+		gnome) display_manager=gdm.service ;;
+		esac
+		systemctl --root="$TARGET" enable "$display_manager"
+		systemctl --root="$TARGET" set-default graphical.target
+	else
+		systemctl --root="$TARGET" set-default multi-user.target
+	fi
+	if [ "$ENABLE_SSH" = yes ]; then
+		systemctl --root="$TARGET" enable sshd.service
+		chroot "$TARGET" firewall-offline-cmd --quiet --service=ssh
+	else
+		systemctl --root="$TARGET" disable sshd.service 2>/dev/null || :
+		chroot "$TARGET" firewall-offline-cmd --quiet --remove-service=ssh 2>/dev/null || :
+	fi
+}
+
+bind_system_mounts() {
+	local dir
+	# Everything that runs inside the target with chroot needs these, from
+	# firewall-offline-cmd to dracut and sdbootutil, so they go up before the
+	# first of them rather than before the last. Earlier is not possible: the
+	# mount points themselves arrive with the base.
+	for dir in /proc /sys /dev /run; do
+		mount --rbind "$dir" "$TARGET$dir"
+		mount --make-rslave "$TARGET$dir"
+	done
+}
+
+write_fstab() {
+	log "fstab"
+	local root_options=defaults
+	[ "$FSTYPE" = btrfs ] && root_options=subvol=@
+
+	cat > "$TARGET/etc/fstab" <<-EOF
+		UUID=$ROOT_UUID  /          $FSTYPE  $root_options  0 1
+		UUID=$ESP_UUID  /boot/efi  vfat     umask=0077     0 2
+	EOF
+
+	if [ "$ENCRYPT" = yes ]; then
+		printf 'cr_root UUID=%s none luks\n' "$ROOT_PART_UUID" > "$TARGET/etc/crypttab"
+	fi
+}
+
+configure_swap() {
+	local swap_path=/swap/swapfile
+	case $SWAP_MODE in
+	zram)
+		rm -f "$TARGET/etc/systemd/zram-generator.conf"
+		;;
+	none)
+		install -Dm 0644 /dev/null "$TARGET/etc/systemd/zram-generator.conf"
+		;;
+	swapfile)
+		install -Dm 0644 /dev/null "$TARGET/etc/systemd/zram-generator.conf"
+		if [ "$FSTYPE" = btrfs ]; then
+			# The area has to be nocow, uncompressed and free of
+			# preallocated extents; mkswapfile is what gets all three
+			# right on its own.
+			btrfs subvolume create "$TARGET/swap" >/dev/null
+			btrfs filesystem mkswapfile --size "$SWAP_SIZE" "$TARGET$swap_path" >/dev/null
+		else
+			mkdir -p "$TARGET/swap"
+			# mkswap creates the file itself: a file left by fallocate
+			# keeps unwritten extents, and swapon skips those as holes.
+			mkswap --size "$SWAP_SIZE" --file "$TARGET$swap_path" >/dev/null
+		fi
+		chmod 0600 "$TARGET$swap_path"
+		printf '%s none swap defaults 0 0\n' "$swap_path" >> "$TARGET/etc/fstab"
+		;;
+	esac
+}
+
+configure_network() {
+	local source=/etc/NetworkManager/system-connections
+	[ "$NETWORK_MODE" = copy ] || return 0
+	[ -d "$source" ] || return 0
+	install -dm 0700 "$TARGET$source"
+	cp -a "$source"/. "$TARGET$source"/
+	find "$TARGET$source" -type f -exec chmod 0600 {} +
+}
+
+configure_system() {
+	log "system configuration"
+	local index password_hash groups
+	if [ "$TUI" != yes ]; then
+		LOCALE=$(ask "locale" en_US.UTF-8)
+		# Ask for the keymap before any password: under the wrong layout the
+		# password typed is not the one intended, and that only surfaces at the
+		# first login.
+		KEYMAP=$(ask "console keymap" us)
+		TIMEZONE=$(ask "time zone" UTC)
+		HOSTNAME=$(ask "machine name" nekoawai)
+		ROOT_PASSWORD=$(ask_secret "root password")
+	fi
+
+	systemd-firstboot --root="$TARGET" --force \
+		--locale="$LOCALE" --timezone="$TIMEZONE" --hostname="$HOSTNAME" \
+		--keymap="$KEYMAP"
+
+	# Set the password as a hash through usermod rather than chpasswd:
+	# chpasswd and passwd are labelled passwd_exec_t, and on a SELinux
+	# machine that domain may not chroot into the target root. usermod runs
+	# in a domain that may.
+	if [ "$ROOT_LOCKED" = yes ]; then
+		usermod --root "$TARGET" --lock root
+	else
+		password_hash=$(printf '%s' "$ROOT_PASSWORD" | openssl passwd -6 -stdin)
+		usermod --root "$TARGET" --password "$password_hash" root
+	fi
+
+	for index in "${!USER_NAMES[@]}"; do
+		groups=
+		[ "${USER_WHEEL[$index]}" != yes ] || groups=wheel
+		if [ -n "$groups" ]; then
+			useradd --root "$TARGET" --create-home --shell /bin/bash --groups "$groups" "${USER_NAMES[$index]}"
+		else
+			useradd --root "$TARGET" --create-home --shell /bin/bash "${USER_NAMES[$index]}"
+		fi
+		password_hash=$(printf '%s' "${USER_PASSWORDS[$index]}" | openssl passwd -6 -stdin)
+		usermod --root "$TARGET" --password "$password_hash" "${USER_NAMES[$index]}"
+	done
+	ROOT_PASSWORD=
+	USER_PASSWORDS=()
+}
+
+build_initramfs() {
+	log "initramfs"
+	# Not hostonly: the installer does not run on the machine the system will
+	# live on, and an image built for the hardware here would find neither
+	# disk nor root there.
+	chroot "$TARGET" dracut --force --no-hostonly --regenerate-all
+}
+
+install_bootloader() {
+	log "systemd-boot"
+	local options efi_flags=
+
+	# sdbootutil refuses to run at all without a real efivarfs. Where there
+	# is none, leave the variables alone: the fallback BOOTX64.EFI on the ESP
+	# boots the machine without an NVRAM entry.
+	[ "$(findmnt -no FSTYPE /sys/firmware/efi/efivars 2>/dev/null)" = efivarfs ] ||
+		efi_flags=--no-variables
+
+	options="root=UUID=$ROOT_UUID rw quiet loglevel=3"
+	[ "$FSTYPE" = btrfs ] && options="$options rootflags=subvol=@"
+	[ "$ENCRYPT" = yes ] && options="rd.luks.uuid=$ROOT_PART_UUID $options"
+
+	# The kernel package scriptlet reads the command line from here on every
+	# update, so it lives in the system and not only in the ESP entry.
+	install -dm 0755 "$TARGET/etc/kernel"
+	printf '%s\n' "$options" > "$TARGET/etc/kernel/cmdline"
+
+	# sdbootutil lays out the ESP, and the kernel package scriptlet calls it
+	# again on every kernel update.
+	chroot "$TARGET" sdbootutil $efi_flags install
+	chroot "$TARGET" sdbootutil $efi_flags add-all-kernels
+
+	# `sdbootutil set-timeout` writes the LoaderConfigTimeout EFI variable,
+	# which goes nowhere without efivarfs. loader.conf always survives.
+	printf 'timeout 3\n' >> "$TARGET/boot/efi/loader/loader.conf"
+}
+
+save_install_profile() {
+	# 0600: the file records the layout and whether the root is encrypted.
+	local users
+	users=$(IFS=,; printf '%s' "${USER_NAMES[*]}")
+	{
+		printf 'DISK=%q\n' "$DISK"
+		printf 'FSTYPE=%q\n' "$FSTYPE"
+		printf 'ENCRYPT=%q\n' "$ENCRYPT"
+		printf 'PROFILE=%q\n' "$PROFILE"
+		printf 'DESKTOP=%q\n' "$DESKTOP"
+		printf 'SWAP_MODE=%q\n' "$SWAP_MODE"
+		printf 'LOCALE=%q\n' "$LOCALE"
+		printf 'KEYMAP=%q\n' "$KEYMAP"
+		printf 'TIMEZONE=%q\n' "$TIMEZONE"
+		printf 'HOSTNAME=%q\n' "$HOSTNAME"
+		printf 'NETWORK_MODE=%q\n' "$NETWORK_MODE"
+		printf 'ENABLE_SSH=%q\n' "$ENABLE_SSH"
+		printf 'USERS=%q\n' "$users"
+	} > "$TARGET/etc/nekoawai/install.conf"
+	chmod 0600 "$TARGET/etc/nekoawai/install.conf"
+}
+
+unmount_target() {
+	umount -R "$TARGET" 2>/dev/null || :
+	[ "$ENCRYPT" = yes ] && cryptsetup close cr_root 2>/dev/null || :
+}
+
+run_step() {
+	CURRENT_STEP=$1
+	shift
+	[ "$TUI" != yes ] || printf '\n%s>>%s %s\n' "$TUI_BRAND" "$TUI_PLAIN" "$CURRENT_STEP"
+	"$@"
+}
+
+installation_failed() {
+	local status=$?
+	trap - ERR
+	# Descriptor 3 is the terminal itself. The rest of the run goes through
+	# tee, and the one line that must not be lost to its buffer is this one.
+	printf '\nfailed step: %s\nsee %s\n' "${CURRENT_STEP:-unknown}" "$INSTALL_LOG" >&3
+	exit "$status"
+}
+
+usage() {
+	cat <<-EOF
+		Usage: nekoawai-install [--text]
+
+		Interactive NekoAwai system installer.
+		  --text       use the line-oriented fallback for automated tests
+		  -h, --help   show this help
+		  -V, --version
+	EOF
+}
+
+main() {
+	local force_text=no
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--text) force_text=yes ;;
+		-h | --help) usage; return ;;
+		-V | --version) printf 'nekoawai-install %s\n' "$VERSION"; return ;;
+		*) die "unknown argument: $1" ;;
+		esac
+		shift
+	done
+
+	require_uefi_root
+	exec 3>&2
+	if [ "$force_text" = no ] && [ -t 0 ] && [ -t 1 ]; then
+		TUI=yes
+		configure_tui
+	else
+		select_disk
+		select_layout
+		confirm_wipe
+	fi
+
+	trap unmount_target EXIT
+	trap installation_failed ERR
+	: > "$INSTALL_LOG"
+	detect_gpu_packages
+
+	if [ "$TUI" = yes ]; then
+		tui_screen "Installing NekoAwai. Everything below also goes to $INSTALL_LOG"
+		# On screen and in the log at once. The package step runs for minutes,
+		# and a screen that shows nothing while it works cannot be told apart
+		# from a machine that has stopped.
+		exec > >(tee -a "$INSTALL_LOG") 2>&1
+	fi
+
+	run_step "Partitioning $DISK" partition_disk
+	run_step "Setting up LUKS2" open_encrypted_root
+	run_step "Creating filesystems" format_filesystems
+	run_step "Mounting the target" mount_target
+	run_step "Installing packages" install_base
+	run_step "Binding /proc, /sys, /dev and /run" bind_system_mounts
+	run_step "Keeping the NekoAwai repository" keep_own_packages
+	run_step "Applying the systemd policy" apply_service_policy
+	run_step "Writing fstab" write_fstab
+	run_step "Setting up swap" configure_swap
+	run_step "Configuring the system and users" configure_system
+	run_step "Configuring the network" configure_network
+	run_step "Building the initramfs" build_initramfs
+	run_step "Installing systemd-boot" install_bootloader
+	run_step "Saving the installation profile" save_install_profile
+
+	trap - ERR
+	trap - EXIT
+	unmount_target
+
+	if [ "$TUI" = yes ]; then
+		if tui_confirm "NekoAwai is installed. Reboot now?" yes; then
+			systemctl reboot
+		fi
+	else
+		log "installation finished"
+		# An `&&` list here would make a declined reboot the exit status of a
+		# successful install.
+		if [ "$(ask "reboot now (yes/no)" yes)" = yes ]; then
+			systemctl reboot
+		fi
+	fi
+}
+
+# scripts/make-rootfs.sh sources this file to unpack the base with the same
+# steps, so run the interactive install only when executed directly.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	main "$@"
+fi

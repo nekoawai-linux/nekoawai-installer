@@ -1,0 +1,33 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: syntax, ASCII screens, version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: make check
+        run: make check
+
+      - name: Release archive is reproducible
+        run: |
+          make dist
+          sha256sum dist/*.tar.gz > expected
+          rm -rf dist
+          make dist
+          sha256sum -c expected
