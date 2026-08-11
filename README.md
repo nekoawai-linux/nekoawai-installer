@@ -28,6 +28,17 @@ its own full-screen menus, so it needs no TUI library and stays readable on a
 console that has only the built-in font. Arrow keys move, Enter confirms, Esc
 goes back.
 
+The menu says what is still missing while it is still fixable, every entry
+explains itself in a line, and the install shows each step with the time it
+took.
+
+Packages beyond the profile can be searched for by name: the package screen
+takes a word, lists what the repositories have with a summary each, and Space
+marks the ones to install. The package list is fetched once, on the first
+search, into `NEKO_INDEX_ROOT` (`/var/tmp/nekoawai-index` by default) -- the
+Live system carries packages, not an index, so there is nothing to search
+until then.
+
 The disk is destroyed only after a complete summary and a second confirmation
 that names the disk. Nothing is written before that.
 
@@ -40,7 +51,8 @@ under `C.UTF-8` so the tools it calls answer in English as well.
     nekoawai-install --version
 
 The target RPM repository is read from `NEKO_TARGET_REPO`, which defaults to
-`/run/nekoawai/repo`. Upstream packages come from `NEKO_CORE_REPO`.
+`/run/nekoawai/repo`. Upstream packages come from `NEKO_CORE_REPO`, and the
+searchable package list is kept in `NEKO_INDEX_ROOT`.
 
 ## Packaging
 

@@ -3,7 +3,7 @@ DESTDIR ?=
 DISTDIR ?= dist
 SOURCE_DATE_EPOCH ?= 1786320000
 
-VERSION := 0.2.0
+VERSION := 0.3.1
 ARCHIVE := $(DISTDIR)/nekoawai-installer-$(VERSION).tar.gz
 SOURCES := LICENSE Makefile README.md nekoawai-install
 

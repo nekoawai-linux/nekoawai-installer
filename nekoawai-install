@@ -15,7 +15,7 @@ export LC_ALL=C.UTF-8
 
 TARGET=/mnt
 ESP_SIZE=512MiB
-VERSION=0.2.0
+VERSION=0.3.1
 INSTALL_LOG=/tmp/nekoawai-install.log
 
 # Where the nekoawai-* packages live on the installation medium. Until
@@ -23,8 +23,13 @@ INSTALL_LOG=/tmp/nekoawai-install.log
 : "${NEKO_TARGET_REPO:=${NEKO_LOCAL_REPO:-/run/nekoawai/repo}}"
 : "${NEKO_CORE_REPO:=http://download.opensuse.org/tumbleweed/repo/oss/}"
 : "${NEKO_DETECT_GPU:=yes}"
+# The Live system carries packages, not a package list, and no repository of
+# its own. Package search needs one, so it gets a root to keep it in; on the
+# Live medium that root is memory and disappears with the session.
+: "${NEKO_INDEX_ROOT:=/var/tmp/nekoawai-index}"
 
 DISK=
+DISK_LABEL=
 ESP_PART=
 ROOT_PART=
 ROOT_DEV=
@@ -49,6 +54,8 @@ ROOT_PASSWORD=
 LUKS_PASSPHRASE=
 TUI=no
 GPU_PACKAGES=
+STEP_INDEX=0
+STEP_TOTAL=0
 
 declare -a USER_NAMES=()
 declare -a USER_PASSWORDS=()
@@ -90,11 +97,20 @@ ask_secret() {
 TUI_BRAND=$'\033[1;35m'
 TUI_DIM=$'\033[2m'
 TUI_SELECTED=$'\033[7m'
+TUI_OK=$'\033[1;32m'
+TUI_WARN=$'\033[1;33m'
 TUI_PLAIN=$'\033[0m'
+TUI_RULE=------------------------------------------------------------------------
+
+# One line of hint text per menu entry, keyed by tag. Set it right before the
+# tui_menu call that needs it; the menu takes the hints and clears them, so
+# nothing leaks into the next screen.
+declare -A TUI_HINT=()
 
 tui_screen() {
-	printf '\033[2J\033[H%sNekoAwai Installer %s%s\n\n' \
-		"$TUI_BRAND" "$VERSION" "$TUI_PLAIN"
+	printf '\033[2J\033[H%s NekoAwai Installer %s %s=^..^=%s\n%s %s%s\n\n' \
+		"$TUI_BRAND" "$VERSION" "$TUI_DIM" "$TUI_PLAIN" \
+		"$TUI_DIM" "$TUI_RULE" "$TUI_PLAIN"
 	[ -z "${1:-}" ] || printf '%s\n\n' "$1"
 }
 
@@ -106,6 +122,8 @@ tui_key() {
 	IFS= read -rsn1 key || { KEY=escape; return; }
 	case $key in
 	'') KEY=enter ;;
+	' ') KEY=space ;;
+	/) KEY=search ;;
 	k) KEY=up ;;
 	j) KEY=down ;;
 	$'\033')
@@ -123,9 +141,10 @@ tui_key() {
 # Leaving with Esc returns non-zero and REPLY keeps its previous value, so a
 # cancelled submenu changes no setting.
 tui_menu() {
-	local caption=$1 index=0 last width=0 position
+	local caption=$1 index=0 last width=0 position key hint
 	shift
 	local -a tags=() labels=()
+	local -A hints=()
 	while [ "$#" -gt 1 ]; do
 		tags+=("$1")
 		labels+=("$2")
@@ -135,6 +154,8 @@ tui_menu() {
 	for position in "${!labels[@]}"; do
 		[ "${#labels[$position]}" -le "$width" ] || width=${#labels[$position]}
 	done
+	for key in "${!TUI_HINT[@]}"; do hints[$key]=${TUI_HINT[$key]}; done
+	TUI_HINT=()
 
 	while :; do
 		tui_screen "$caption"
@@ -146,6 +167,8 @@ tui_menu() {
 				printf '   %-*s \n' "$width" "${labels[$position]}"
 			fi
 		done
+		hint=${hints[${tags[$index]}]:-}
+		[ -z "$hint" ] || printf '\n%s   %s%s\n' "$TUI_DIM" "$hint" "$TUI_PLAIN"
 		printf '\n%sup/down choose, enter confirm, esc back%s\n' \
 			"$TUI_DIM" "$TUI_PLAIN"
 
@@ -199,7 +222,7 @@ tui_password() {
 }
 
 select_disk_tui() {
-	local line
+	local line size model
 	local -a items=()
 	while IFS= read -r line; do
 		items+=("${line%% *}" "$line")
@@ -209,10 +232,16 @@ select_disk_tui() {
 	if tui_menu "Select a disk. It is erased only after the confirmation." \
 		"${items[@]}"; then
 		DISK=$REPLY
+		read -r size model < <(lsblk -dno SIZE,MODEL "$DISK") || :
+		DISK_LABEL="$size${model:+ $model}"
 	fi
 }
 
 select_profile_tui() {
+	TUI_HINT=(
+		[minimal]="Console only: the base system, no graphics."
+		[desktop]="Adds graphics, audio, fonts and a login screen."
+	)
 	if ! tui_menu "System type" \
 		minimal "Minimal CLI system" \
 		desktop "Graphical system"; then
@@ -223,6 +252,13 @@ select_profile_tui() {
 		DESKTOP=
 		return
 	fi
+	TUI_HINT=(
+		[niri]="Scrolling tiles on Wayland, with LightDM. Keyboard driven."
+		[hyprland]="Tiling Wayland compositor with animations, with SDDM."
+		[gnome]="The full GNOME session on Wayland, with GDM."
+		[plasma]="KDE Plasma on Wayland, with SDDM. Configurable to the bone."
+		[xfce]="A classic desktop on Xorg, with LightDM. Light and familiar."
+	)
 	if tui_menu "Choose one desktop" \
 		niri "Niri" \
 		hyprland "Hyprland" \
@@ -234,6 +270,10 @@ select_profile_tui() {
 }
 
 select_storage_tui() {
+	TUI_HINT=(
+		[ext4]="Plain and predictable."
+		[btrfs]="Subvolumes, compression and snapshots later on."
+	)
 	if tui_menu "Root filesystem" ext4 "ext4" btrfs "btrfs with an @ subvolume"; then
 		FSTYPE=$REPLY
 	fi
@@ -252,6 +292,11 @@ select_storage_tui() {
 }
 
 select_swap_tui() {
+	TUI_HINT=(
+		[zram]="Compressed swap in memory. Takes no disk and suits an encrypted root."
+		[swapfile]="A file on the root filesystem. Needed for hibernation."
+		[none]="Nothing to fall back on when memory runs out."
+	)
 	if ! tui_menu "Swap mode" \
 		zram "Compressed swap in RAM" \
 		swapfile "Swap file on the root filesystem" \
@@ -314,16 +359,15 @@ delete_user_tui() {
 }
 
 configure_users_tui() {
-	local choice root_state
+	local choice
 	while :; do
-		if [ "$ROOT_LOCKED" = yes ]; then
-			root_state=locked
-		elif [ -n "$ROOT_PASSWORD" ]; then
-			root_state=set
-		else
-			root_state="not set"
-		fi
-		if ! tui_menu "Root: $root_state, regular users: ${#USER_NAMES[@]}" \
+		TUI_HINT=(
+			[root-password]="Kept for recovery: a locked root needs a user in wheel to get anything done."
+			[root-lock]="No login as root at all. Administration then goes through sudo."
+			[add]="The account for daily use. A desktop needs at least one."
+			[delete]="Takes an account off the list. Nothing has been created yet."
+		)
+		if ! tui_menu "Root: $(root_state), regular users: ${#USER_NAMES[@]}" \
 			root-password "Set the root password" \
 			root-lock "Lock the root account" \
 			add "Add a user" \
@@ -345,6 +389,11 @@ configure_users_tui() {
 }
 
 configure_network_tui() {
+	TUI_HINT=(
+		[automatic]="A wired network that hands out addresses needs nothing else."
+		[copy]="Takes the Wi-Fi passwords entered here over to the new system."
+		[nmtui]="Connect here first, then the connection is carried over."
+	)
 	if ! tui_menu "Networking in the installed system" \
 		automatic "NetworkManager with automatic DHCP" \
 		copy "Copy the connections of the Live system" \
@@ -358,41 +407,201 @@ configure_network_tui() {
 	fi
 }
 
+# Search results, package by package: name on the left, what the repository
+# says about it on the right, and a mark for the ones already on the list.
+search_packages_tui() {
+	local query index top rows=12 last position name summary mark row again
+	local -a names=() summaries=()
+
+	while :; do
+		tui_input "Package search" "Search for"
+		query=$REPLY
+		[ -n "$query" ] || return
+
+		tui_screen "Looking for $query ..."
+		if ! package_index; then
+			tui_message "The package list could not be fetched. Check the network and try again."
+			return
+		fi
+		names=()
+		summaries=()
+		while IFS=$'\t' read -r name summary; do
+			names+=("$name")
+			summaries+=("$summary")
+		done < <(package_search "$query")
+		if [ "${#names[@]}" -eq 0 ]; then
+			tui_message "Nothing in the repositories matches $query."
+			continue
+		fi
+
+		index=0
+		top=0
+		last=$(( ${#names[@]} - 1 ))
+		again=no
+		while [ "$again" = no ]; do
+			[ "$index" -ge "$top" ] || top=$index
+			[ "$index" -lt $(( top + rows )) ] || top=$(( index - rows + 1 ))
+			tui_screen "$(printf '%s packages match %s. Marked ones are installed with the system.' \
+				"${#names[@]}" "$query")"
+			for (( position = top; position < top + rows && position <= last; position++ )); do
+				mark=' '
+				package_selected "${names[$position]}" && mark=x
+				row=$(printf '[%s] %-28s %s' "$mark" "${names[$position]}" "${summaries[$position]}")
+				if [ "$position" -eq "$index" ]; then
+					printf '%s > %-74s %s\n' "$TUI_SELECTED" "${row:0:74}" "$TUI_PLAIN"
+				else
+					printf '   %s\n' "${row:0:74}"
+				fi
+			done
+			printf '\n%son the list: %s%s\n' \
+				"$TUI_DIM" "${ADDITIONAL_PACKAGES:-nothing yet}" "$TUI_PLAIN"
+			printf '%sspace marks, / searches again, enter keeps the list, esc goes back%s\n' \
+				"$TUI_DIM" "$TUI_PLAIN"
+
+			tui_key
+			case $KEY in
+			up) [ "$index" -gt 0 ] && index=$(( index - 1 )) || index=$last ;;
+			down) [ "$index" -lt "$last" ] && index=$(( index + 1 )) || index=0 ;;
+			space) package_toggle "${names[$index]}" ;;
+			search) again=yes ;;
+			enter | escape) return ;;
+			esac
+		done
+	done
+}
+
 configure_packages_tui() {
-	if tui_input "Additional packages" \
-		"Exact package names separated by spaces. Leave empty if there are none." \
-		"$ADDITIONAL_PACKAGES"; then
-		ADDITIONAL_PACKAGES=$REPLY
-	fi
+	while :; do
+		TUI_HINT=(
+			[search]="Type a word and pick from what the repositories actually have."
+			[names]="For names you already know, separated by spaces."
+			[clear]="Start the list over."
+		)
+		if ! tui_menu "Packages installed along with the system: ${ADDITIONAL_PACKAGES:-none}" \
+			search "Search the repositories" \
+			names "Type the names" \
+			clear "Clear the list" \
+			back "Back"; then
+			return
+		fi
+		case $REPLY in
+		search) search_packages_tui ;;
+		names)
+			tui_input "Additional packages" \
+				"Exact package names separated by spaces. Leave empty if there are none." \
+				"$ADDITIONAL_PACKAGES"
+			ADDITIONAL_PACKAGES=$REPLY
+			;;
+		clear) ADDITIONAL_PACKAGES= ;;
+		back) return ;;
+		esac
+	done
 }
 
 toggle_ssh_tui() {
 	if [ "$ENABLE_SSH" = yes ]; then ENABLE_SSH=no; else ENABLE_SSH=yes; fi
 }
 
+root_state() {
+	if [ "$ROOT_LOCKED" = yes ]; then
+		printf 'locked'
+	elif [ -n "$ROOT_PASSWORD" ]; then
+		printf 'password set'
+	else
+		printf 'not set'
+	fi
+}
+
 configuration_summary() {
-	local users_text=none name swap_text=$SWAP_MODE
+	local users_text=none name index swap_text=$SWAP_MODE
 	if [ "${#USER_NAMES[@]}" -gt 0 ]; then
 		users_text=
-		for name in "${USER_NAMES[@]}"; do users_text="${users_text:+$users_text, }$name"; done
+		for index in "${!USER_NAMES[@]}"; do
+			name=${USER_NAMES[$index]}
+			[ "${USER_WHEEL[$index]}" != yes ] || name="$name (wheel)"
+			users_text="${users_text:+$users_text, }$name"
+		done
 	fi
 	[ "$SWAP_MODE" = swapfile ] && swap_text="swapfile ($SWAP_SIZE)"
 	cat <<-EOF
-		Disk:        ${DISK:-not selected}
-		Filesystem:  $FSTYPE
-		Encryption:  $ENCRYPT
-		Profile:     ${DESKTOP:-$PROFILE}
-		Swap:        $swap_text
-		Hostname:    ${HOSTNAME:-not set}
-		Locale:      ${LOCALE:-not set}
-		Keymap:      ${KEYMAP:-not set}
-		Timezone:    ${TIMEZONE:-not set}
-		Users:       $users_text
-		Root locked: $ROOT_LOCKED
-		Network:     $NETWORK_MODE
-		SSH:         $ENABLE_SSH
-		Packages:    ${ADDITIONAL_PACKAGES:-none}
+		${TUI_BRAND}Disk${TUI_PLAIN}
+		  Target       ${DISK:-not selected}${DISK_LABEL:+  ($DISK_LABEL)}
+		  Filesystem   ${FSTYPE:-not selected}, LUKS2 $ENCRYPT
+		  Swap         $swap_text
+
+		${TUI_BRAND}System${TUI_PLAIN}
+		  Profile      ${DESKTOP:-$PROFILE}
+		  Hostname     ${HOSTNAME:-not set}
+		  Locale       ${LOCALE:-not set}, keymap ${KEYMAP:-not set}
+		  Time zone    ${TIMEZONE:-not set}
+		  Packages     ${ADDITIONAL_PACKAGES:-none beyond the profile}
+
+		${TUI_BRAND}Accounts and network${TUI_PLAIN}
+		  Users        $users_text
+		  Root         $(root_state)
+		  Network      $NETWORK_MODE
+		  SSH          $ENABLE_SSH
 	EOF
+}
+
+# The Live system has no repositories of its own: the medium carries the
+# packages of the distribution, and everything else is fetched during the
+# install. So searching means keeping a package list somewhere, and it goes
+# into a root of its own rather than into whatever system the installer
+# happens to run on. Fetched once, on the first search.
+#
+# ponytail: the install downloads the same metadata again into the target.
+# Sharing one cache between the two is a --cache-dir away if the second
+# download starts to hurt.
+package_index() {
+	[ ! -f "$NEKO_INDEX_ROOT/etc/zypp/repos.d/nekoawai-index.repo" ] || return 0
+	[ "$TUI" != yes ] || tui_screen "Fetching the package list. This happens once and needs the network."
+	install -dm 0755 "$NEKO_INDEX_ROOT"
+	{
+		zypper --root "$NEKO_INDEX_ROOT" --non-interactive --gpg-auto-import-keys \
+			addrepo --refresh "$NEKO_CORE_REPO" nekoawai-index &&
+		if [ -d "$NEKO_TARGET_REPO" ]; then
+			zypper --root "$NEKO_INDEX_ROOT" --non-interactive \
+				addrepo --no-gpgcheck --priority 90 \
+				"dir:$NEKO_TARGET_REPO" nekoawai-index-local
+		fi &&
+		zypper --root "$NEKO_INDEX_ROOT" --non-interactive --gpg-auto-import-keys refresh
+	} >> "$INSTALL_LOG" 2>&1 && return 0
+
+	# A half-built index would be taken for a finished one on the next call.
+	rm -rf "$NEKO_INDEX_ROOT"
+	return 1
+}
+
+# Name and summary of every package matching the term, as zypper prints them
+# in its table. The list stops at 200: past that the screen is a haystack and
+# a narrower search is the answer.
+package_search() {
+	zypper --root "$NEKO_INDEX_ROOT" --non-interactive --no-refresh \
+		search --type package -- "$1" 2>/dev/null |
+		awk -F' *\\| *' '
+			/^-+\+/ { body = 1; next }
+			body && NF >= 3 && $2 != "" { print $2 "\t" $3 }
+		' | head -n 200
+}
+
+package_selected() {
+	case " $ADDITIONAL_PACKAGES " in
+	*" $1 "*) return 0 ;;
+	esac
+	return 1
+}
+
+package_toggle() {
+	local wanted=$1 package kept=
+	if ! package_selected "$wanted"; then
+		ADDITIONAL_PACKAGES="${ADDITIONAL_PACKAGES:+$ADDITIONAL_PACKAGES }$wanted"
+		return
+	fi
+	for package in $ADDITIONAL_PACKAGES; do
+		[ "$package" = "$wanted" ] || kept="${kept:+$kept }$package"
+	done
+	ADDITIONAL_PACKAGES=$kept
 }
 
 package_available() {
@@ -401,64 +610,78 @@ package_available() {
 		[ -e "$rpm" ] || break
 		[ "$(rpm -qp --qf '%{NAME}' "$rpm" 2>/dev/null)" != "$wanted" ] || return 0
 	done
-	zypper --non-interactive --no-refresh --xmlout search --match-exact \
-		--type package "$wanted" 2>/dev/null | grep -q "name=\"$wanted\""
+	package_index || return 1
+	zypper --root "$NEKO_INDEX_ROOT" --non-interactive --no-refresh --xmlout \
+		search --match-exact --type package "$wanted" 2>/dev/null |
+		grep -q "name=\"$wanted\""
 }
 
+# The first problem in menu order is the one worth showing: it is the one
+# the user reaches first, and a later check must not talk over it.
+problem() { [ -n "$VALIDATION_ERROR" ] || VALIDATION_ERROR=$1; }
+
+# Without an argument the checks stay local, so the menu can run them on
+# every redraw. `full` also asks the repositories, which costs a package list
+# and belongs to the moment before the disk is erased.
 validate_configuration() {
-	local name package has_admin=no profile_package=patterns-nekoawai-base
+	local depth=${1:-local} name package has_admin=no
+	local profile_package=patterns-nekoawai-base
 	VALIDATION_ERROR=
-	[ -n "$DISK" ] && [ -b "$DISK" ] || VALIDATION_ERROR="Select an installation disk."
-	if [ -n "$DISK" ] && lsblk -nrpo MOUNTPOINT "$DISK" | grep -q '[^[:space:]]'; then
-		VALIDATION_ERROR="There are mounted filesystems on $DISK."
+	[ -n "$DISK" ] && [ -b "$DISK" ] || problem "Select an installation disk."
+	# Quiet: the menu runs these checks on every redraw, and a disk that has
+	# been unplugged must not write over the screen.
+	if [ -n "$DISK" ] && lsblk -nrpo MOUNTPOINT "$DISK" 2>/dev/null | grep -q '[^[:space:]]'; then
+		problem "There are mounted filesystems on $DISK."
 	fi
 	case $FSTYPE in
 	ext4 | btrfs) ;;
-	*) VALIDATION_ERROR="Select a filesystem: ext4 or btrfs." ;;
+	*) problem "Select a filesystem: ext4 or btrfs." ;;
 	esac
-	[ "$PROFILE" != desktop ] || [ -n "$DESKTOP" ] || VALIDATION_ERROR="Select a desktop."
-	[ "$PROFILE" != desktop ] || profile_package="patterns-nekoawai-$DESKTOP"
-	if [ -n "$DESKTOP" ] || [ "$PROFILE" = minimal ]; then
-		package_available "$profile_package" || VALIDATION_ERROR="Profile not found in the repositories: $profile_package"
-	fi
-	[ "$ENCRYPT" != yes ] || [ -n "$LUKS_PASSPHRASE" ] || VALIDATION_ERROR="Set the LUKS2 passphrase."
-	[[ ${HOSTNAME:-} =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] || VALIDATION_ERROR="Invalid hostname."
-	[ -n "$LOCALE" ] || VALIDATION_ERROR="Set the locale."
-	[ -n "$KEYMAP" ] || VALIDATION_ERROR="Set the console keymap."
-	[ -f "/usr/share/zoneinfo/${TIMEZONE:-}" ] || VALIDATION_ERROR="Unknown time zone: ${TIMEZONE:-empty}."
+	[ "$ENCRYPT" != yes ] || [ -n "$LUKS_PASSPHRASE" ] || problem "Set the LUKS2 passphrase."
 	[ "$SWAP_MODE" != swapfile ] || [[ $SWAP_SIZE =~ ^[1-9][0-9]*[MG]$ ]] || \
-		VALIDATION_ERROR="The swap file size has to look like 4096M or 4G."
+		problem "The swap file size has to look like 4096M or 4G."
+	[ "$PROFILE" != desktop ] || [ -n "$DESKTOP" ] || problem "Select a desktop."
+	[ "$PROFILE" != desktop ] || profile_package="patterns-nekoawai-$DESKTOP"
+	[[ ${HOSTNAME:-} =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] || problem "Invalid hostname."
+	[ -n "$LOCALE" ] || problem "Set the locale."
+	[ -n "$KEYMAP" ] || problem "Set the console keymap."
+	[ -f "/usr/share/zoneinfo/${TIMEZONE:-}" ] || problem "Unknown time zone: ${TIMEZONE:-empty}."
 
 	for name in "${USER_WHEEL[@]}"; do [ "$name" != yes ] || has_admin=yes; done
 	if [ "$PROFILE" = desktop ] && [ "${#USER_NAMES[@]}" -eq 0 ]; then
-		VALIDATION_ERROR="A desktop needs at least one regular user."
-	fi
-	if [ "$ENABLE_SSH" = yes ] && [ "$has_admin" != yes ]; then
-		VALIDATION_ERROR="SSH needs a user in the wheel group."
+		problem "A desktop needs at least one regular user."
 	fi
 	if [ "$ROOT_LOCKED" != yes ] && [ -z "$ROOT_PASSWORD" ]; then
-		VALIDATION_ERROR="Set the root password or lock the root account."
+		problem "Set the root password or lock the root account."
 	fi
 	if [ "$ROOT_LOCKED" = yes ] && [ "${#USER_NAMES[@]}" -eq 0 ]; then
-		VALIDATION_ERROR="Root cannot be locked without a regular user."
+		problem "Root cannot be locked without a regular user."
+	fi
+	if [ "$ENABLE_SSH" = yes ] && [ "$has_admin" != yes ]; then
+		problem "SSH needs a user in the wheel group."
 	fi
 
 	for package in $ADDITIONAL_PACKAGES; do
-		if ! [[ $package =~ ^[A-Za-z0-9@._+:-]+$ ]]; then
-			VALIDATION_ERROR="Invalid package name: $package"
-			break
-		fi
-		if ! package_available "$package"; then
-			VALIDATION_ERROR="Package not found in the enabled repositories: $package"
-			break
-		fi
+		[[ $package =~ ^[A-Za-z0-9@._+:-]+$ ]] || problem "Invalid package name: $package"
 	done
+
+	if [ "$depth" = full ] && [ -z "$VALIDATION_ERROR" ]; then
+		if [ -n "$DESKTOP" ] || [ "$PROFILE" = minimal ]; then
+			package_available "$profile_package" ||
+				problem "Profile not found in the repositories: $profile_package"
+		fi
+		for package in $ADDITIONAL_PACKAGES; do
+			package_available "$package" ||
+				problem "Package not found in the repositories: $package"
+		done
+	fi
 
 	[ -z "$VALIDATION_ERROR" ]
 }
 
 confirm_install_tui() {
-	if ! validate_configuration; then
+	tui_screen "Checking the configuration ..."
+	if ! validate_configuration full; then
 		tui_message "$VALIDATION_ERROR"
 		return 1
 	fi
@@ -467,7 +690,10 @@ confirm_install_tui() {
 		continue "Continue" || return 1
 	[ "$REPLY" = continue ] || return 1
 
-	tui_menu "ALL DATA ON $DISK WILL BE DESTROYED." \
+	# The last screen before the disk is written to says which disk it is, by
+	# name and by what is printed on it.
+	tui_menu "ALL DATA ON $DISK${DISK_LABEL:+ ($DISK_LABEL)} WILL BE DESTROYED.
+Partitions, filesystems and everything on them are gone after this." \
 		back "Cancel" \
 		wipe "Erase $DISK and install" || return 1
 	[ "$REPLY" = wipe ]
@@ -477,7 +703,7 @@ confirm_install_tui() {
 tui_row() { printf '%-16s %s' "$1" "$2"; }
 
 configure_tui() {
-	local choice root_text
+	local choice status
 	HOSTNAME=${HOSTNAME:-nekoawai}
 	LOCALE=${LOCALE:-en_US.UTF-8}
 	KEYMAP=${KEYMAP:-us}
@@ -488,14 +714,33 @@ configure_tui() {
 	printf '\033[?25l'
 
 	while :; do
-		if [ "$ROOT_LOCKED" = yes ]; then root_text=locked; elif [ -n "$ROOT_PASSWORD" ]; then root_text=set; else root_text="not set"; fi
-		if ! tui_menu "Configure the system, then choose Install." \
-			disk "$(tui_row Disk "${DISK:-not selected}")" \
+		# What is still missing, on the screen where it can be fixed, rather
+		# than at the end as a refusal to install.
+		if validate_configuration; then
+			status="${TUI_OK}Ready to install.${TUI_PLAIN}"
+		else
+			status="${TUI_WARN}Still missing: $VALIDATION_ERROR${TUI_PLAIN}"
+		fi
+		TUI_HINT=(
+			[disk]="The disk that gets erased. Nothing is written before the last confirmation."
+			[storage]="The filesystem of the root partition, and whether it is encrypted."
+			[profile]="A console system, or one of five desktops with everything they need."
+			[swap]="Where the system swaps when it runs out of memory."
+			[identity]="Machine name, locale, console keymap and time zone."
+			[users]="Everyday accounts, and what happens to root."
+			[ssh]="Whether sshd listens after the first boot. Needs a user in wheel."
+			[network]="How the installed system gets back on the network."
+			[packages]="Anything to install along with the profile."
+			[install]="Shows the whole configuration first. The disk survives until you confirm."
+			[quit]="Leaves every disk as it is."
+		)
+		if ! tui_menu "Configure the system, then choose Install."$'\n'"$status" \
+			disk "$(tui_row Disk "${DISK:-not selected}${DISK_LABEL:+, $DISK_LABEL}")" \
 			storage "$(tui_row Storage "${FSTYPE:-not selected}, LUKS2 $ENCRYPT")" \
 			profile "$(tui_row Profile "${DESKTOP:-$PROFILE}")" \
 			swap "$(tui_row Swap "$SWAP_MODE")" \
 			identity "$(tui_row System "$HOSTNAME, $LOCALE, $TIMEZONE")" \
-			users "$(tui_row Users "${#USER_NAMES[@]}, root $root_text")" \
+			users "$(tui_row Users "${#USER_NAMES[@]}, root $(root_state)")" \
 			network "$(tui_row Network "$NETWORK_MODE")" \
 			ssh "$(tui_row SSH "$ENABLE_SSH")" \
 			packages "$(tui_row Packages "${ADDITIONAL_PACKAGES:-none}")" \
@@ -896,15 +1141,45 @@ save_install_profile() {
 }
 
 unmount_target() {
-	umount -R "$TARGET" 2>/dev/null || :
+	# A plain umount fails while anything still holds the tree, and the
+	# leftover is then a mount of /run and /dev inside /mnt -- which is
+	# exactly what a shutdown trips over afterwards. Detaching it lazily
+	# leaves nothing behind for systemd to unmount at reboot.
+	umount -R "$TARGET" 2>/dev/null || umount -Rl "$TARGET" 2>/dev/null || :
 	[ "$ENCRYPT" = yes ] && cryptsetup close cr_root 2>/dev/null || :
 }
 
+# `systemctl reboot` hands systemd a job and comes straight back: whether the
+# machine goes down is systemd's business, and one stuck job is enough for it
+# never to happen -- which looks exactly like an installer that ignored the
+# answer. So the wait is bounded. The second attempt skips the job queue and
+# calls reboot(2) itself, and by then there is nothing to lose: the target is
+# unmounted and the Live root lives in memory.
+reboot_now() {
+	printf '\nRebooting. Take the installation medium out.\n'
+	systemctl reboot || :
+	sleep 15
+	printf 'systemd is taking its time. Rebooting the hard way.\n'
+	sync
+	systemctl --force --force reboot || :
+	sleep 5
+	printf 'The machine did not reboot. Power it off by hand: the system on %s is complete.\n' \
+		"$DISK"
+}
+
+# A step that runs for minutes looks the same as a machine that has stopped.
+# The number says how much is left, and the time it took says the wait was
+# real work.
 run_step() {
+	local started=$SECONDS
 	CURRENT_STEP=$1
 	shift
-	[ "$TUI" != yes ] || printf '\n%s>>%s %s\n' "$TUI_BRAND" "$TUI_PLAIN" "$CURRENT_STEP"
+	STEP_INDEX=$(( STEP_INDEX + 1 ))
+	[ "$TUI" != yes ] || printf '\n%s[%2d/%d]%s %s\n' \
+		"$TUI_BRAND" "$STEP_INDEX" "$STEP_TOTAL" "$TUI_PLAIN" "$CURRENT_STEP"
 	"$@"
+	[ "$TUI" != yes ] || printf '%s        took %ss%s\n' \
+		"$TUI_DIM" "$(( SECONDS - started ))" "$TUI_PLAIN"
 }
 
 installation_failed() {
@@ -912,7 +1187,9 @@ installation_failed() {
 	trap - ERR
 	# Descriptor 3 is the terminal itself. The rest of the run goes through
 	# tee, and the one line that must not be lost to its buffer is this one.
-	printf '\nfailed step: %s\nsee %s\n' "${CURRENT_STEP:-unknown}" "$INSTALL_LOG" >&3
+	printf '\n%sStep %s of %s failed: %s%s\n' \
+		"$TUI_WARN" "$STEP_INDEX" "$STEP_TOTAL" "${CURRENT_STEP:-unknown}" "$TUI_PLAIN" >&3
+	printf 'Nothing further was written. The whole run is in %s\n' "$INSTALL_LOG" >&3
 	exit "$status"
 }
 
@@ -928,7 +1205,7 @@ usage() {
 }
 
 main() {
-	local force_text=no
+	local force_text=no started=0 minutes
 	while [ "$#" -gt 0 ]; do
 		case $1 in
 		--text) force_text=yes ;;
@@ -954,15 +1231,19 @@ main() {
 	trap installation_failed ERR
 	: > "$INSTALL_LOG"
 	detect_gpu_packages
+	started=$SECONDS
 
 	if [ "$TUI" = yes ]; then
-		tui_screen "Installing NekoAwai. Everything below also goes to $INSTALL_LOG"
+		tui_screen "Installing ${DESKTOP:-$PROFILE} NekoAwai on $DISK.
+Everything below also goes to $INSTALL_LOG"
 		# On screen and in the log at once. The package step runs for minutes,
 		# and a screen that shows nothing while it works cannot be told apart
 		# from a machine that has stopped.
 		exec > >(tee -a "$INSTALL_LOG") 2>&1
 	fi
 
+	# Keep in step with the run_step calls below.
+	STEP_TOTAL=15
 	run_step "Partitioning $DISK" partition_disk
 	run_step "Setting up LUKS2" open_encrypted_root
 	run_step "Creating filesystems" format_filesystems
@@ -982,17 +1263,24 @@ main() {
 	trap - ERR
 	trap - EXIT
 	unmount_target
+	minutes=$(( (SECONDS - started + 59) / 60 ))
 
 	if [ "$TUI" = yes ]; then
-		if tui_confirm "NekoAwai is installed. Reboot now?" yes; then
-			systemctl reboot
+		if tui_confirm "NekoAwai is on $DISK, ${DESKTOP:-$PROFILE} profile, $minutes min.
+Take the installation medium out before the machine comes back up.
+
+Reboot now?" yes; then
+			# The reboot prints to the screen, and the screen at this point
+			# is the menu's. Give it back before writing on it.
+			tui_screen "Installation finished."
+			reboot_now
 		fi
 	else
 		log "installation finished"
 		# An `&&` list here would make a declined reboot the exit status of a
 		# successful install.
 		if [ "$(ask "reboot now (yes/no)" yes)" = yes ]; then
-			systemctl reboot
+			reboot_now
 		fi
 	fi
 }
