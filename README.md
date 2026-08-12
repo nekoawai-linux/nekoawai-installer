@@ -2,12 +2,16 @@
 
 # nekoawai-install
 
+=^..^=
+
 ![Release](https://img.shields.io/github/v/release/nekoawai-linux/nekoawai-installer?include_prereleases&label=Installer%20Release&style=for-the-badge)
 ![Stars](https://img.shields.io/github/stars/nekoawai-linux/nekoawai-installer?style=for-the-badge&color=%23daaa3f)
 ![License](https://img.shields.io/github/license/nekoawai-linux/nekoawai-installer?color=green&style=for-the-badge)
 [![Website](https://img.shields.io/badge/Website-nekoawai.moe-%23e32b6b?style=for-the-badge)](https://nekoawai.moe)
 
 **The Live-environment installer for [NekoAwai](https://github.com/nekoawai-linux/nekoawai-linux): an editable configuration menu, and one disk written only after you name it.**
+
+Nothing to type but the answers, and nothing hidden behind a progress bar.
 
 </div>
 
