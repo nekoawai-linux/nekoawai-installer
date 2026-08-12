@@ -32,12 +32,19 @@ The menu says what is still missing while it is still fixable, every entry
 explains itself in a line, and the install shows each step with the time it
 took.
 
-Packages beyond the profile can be searched for by name: the package screen
-takes a word, lists what the repositories have with a summary each, and Space
-marks the ones to install. The package list is fetched once, on the first
-search, into `NEKO_INDEX_ROOT` (`/var/tmp/nekoawai-index` by default) -- the
-Live system carries packages, not an index, so there is nothing to search
-until then.
+The package screen has two halves. **NekoAwai packages** is what the
+distribution writes itself -- `nekowall` on a desktop, `nekofetch` on any
+system -- ticked when the screen opens and taken off with Space. A package
+marked off is not installed at all: the patterns recommend rather than
+require them, and the installer locks the refused ones for the length of the
+transaction so a recommendation cannot bring one back. The lock is lifted
+before the system is handed over; the answer was given once, it is not a ban.
+
+Anything else can be searched for by name: the screen takes a word, lists
+what the repositories have with a summary each, and Space marks the ones to
+install. The package list is fetched once, on the first search, into
+`NEKO_INDEX_ROOT` (`/var/tmp/nekoawai-index` by default) -- the Live system
+carries packages, not an index, so there is nothing to search until then.
 
 The disk is destroyed only after a complete summary and a second confirmation
 that names the disk. Nothing is written before that.

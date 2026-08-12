@@ -15,7 +15,7 @@ export LC_ALL=C.UTF-8
 
 TARGET=/mnt
 ESP_SIZE=512MiB
-VERSION=0.3.1
+VERSION=0.4.0
 INSTALL_LOG=/tmp/nekoawai-install.log
 
 # Where the nekoawai-* packages live on the installation medium. Until
@@ -49,6 +49,10 @@ SWAP_SIZE=4G
 NETWORK_MODE=automatic
 ENABLE_SSH=no
 ADDITIONAL_PACKAGES=
+# The packages NekoAwai writes itself, all of them wanted until somebody says
+# otherwise. The list is what is wanted, not what will be installed: what does
+# not suit the profile is left out at the end, see neko_install_list.
+NEKO_PACKAGES="nekowall nekofetch"
 ROOT_LOCKED=no
 ROOT_PASSWORD=
 LUKS_PASSPHRASE=
@@ -470,14 +474,71 @@ search_packages_tui() {
 	done
 }
 
+# The packages of our own, on a screen of their own. Everything here is
+# ticked when it opens: a NekoAwai without them is openSUSE under another
+# name. Space takes one off, and it stays off.
+select_neko_packages_tui() {
+	local index=0 last position name summary mark row hidden=0 caption
+	local -a names=() summaries=()
+
+	while IFS=$'\t' read -r name _ summary; do
+		if ! neko_offered "$name"; then
+			hidden=$(( hidden + 1 ))
+			continue
+		fi
+		names+=("$name")
+		summaries+=("$summary")
+	done < <(neko_package_table)
+
+	if [ "${#names[@]}" -eq 0 ]; then
+		tui_message "None of the NekoAwai packages suit a $PROFILE system."
+		return
+	fi
+
+	caption="What NekoAwai writes itself. All of it comes with the system;
+what is marked off here is not installed at all."
+	# A package missing from the screen is a question the screen should
+	# answer itself, before it is asked somewhere else.
+	[ "$hidden" -eq 0 ] || caption="$caption
+What needs a desktop is not offered to a $PROFILE system."
+
+	last=$(( ${#names[@]} - 1 ))
+	while :; do
+		tui_screen "$caption"
+		for position in "${!names[@]}"; do
+			mark=' '
+			neko_selected "${names[$position]}" && mark=x
+			row=$(printf '[%s] %-12s %s' \
+				"$mark" "${names[$position]}" "${summaries[$position]}")
+			if [ "$position" -eq "$index" ]; then
+				printf '%s > %-74s %s\n' "$TUI_SELECTED" "${row:0:74}" "$TUI_PLAIN"
+			else
+				printf '   %s\n' "${row:0:74}"
+			fi
+		done
+		printf '\n%sspace marks, enter keeps the list, esc goes back%s\n' \
+			"$TUI_DIM" "$TUI_PLAIN"
+
+		tui_key
+		case $KEY in
+		up) [ "$index" -gt 0 ] && index=$(( index - 1 )) || index=$last ;;
+		down) [ "$index" -lt "$last" ] && index=$(( index + 1 )) || index=0 ;;
+		space) neko_toggle "${names[$index]}" ;;
+		enter | escape) return ;;
+		esac
+	done
+}
+
 configure_packages_tui() {
 	while :; do
 		TUI_HINT=(
+			[neko]="Ours, and on by default. Nothing here is needed to boot: take off what you do not want."
 			[search]="Type a word and pick from what the repositories actually have."
 			[names]="For names you already know, separated by spaces."
-			[clear]="Start the list over."
+			[clear]="Start the list of extra packages over."
 		)
-		if ! tui_menu "Packages installed along with the system: ${ADDITIONAL_PACKAGES:-none}" \
+		if ! tui_menu "Packages installed along with the system: $(packages_row)" \
+			neko "NekoAwai packages: $(neko_install_list_text)" \
 			search "Search the repositories" \
 			names "Type the names" \
 			clear "Clear the list" \
@@ -485,6 +546,7 @@ configure_packages_tui() {
 			return
 		fi
 		case $REPLY in
+		neko) select_neko_packages_tui ;;
 		search) search_packages_tui ;;
 		names)
 			tui_input "Additional packages" \
@@ -534,6 +596,7 @@ configuration_summary() {
 		  Hostname     ${HOSTNAME:-not set}
 		  Locale       ${LOCALE:-not set}, keymap ${KEYMAP:-not set}
 		  Time zone    ${TIMEZONE:-not set}
+		  NekoAwai     $(neko_install_list_text)
 		  Packages     ${ADDITIONAL_PACKAGES:-none beyond the profile}
 
 		${TUI_BRAND}Accounts and network${TUI_PLAIN}
@@ -585,23 +648,99 @@ package_search() {
 		' | head -n 200
 }
 
-package_selected() {
-	case " $ADDITIONAL_PACKAGES " in
-	*" $1 "*) return 0 ;;
+# Both package screens keep a list of names in one string, so the marking
+# works the same way for both: a name that is there comes off, a name that is
+# not goes on.
+list_has() {
+	case " $1 " in
+	*" $2 "*) return 0 ;;
 	esac
 	return 1
 }
 
-package_toggle() {
-	local wanted=$1 package kept=
-	if ! package_selected "$wanted"; then
-		ADDITIONAL_PACKAGES="${ADDITIONAL_PACKAGES:+$ADDITIONAL_PACKAGES }$wanted"
+list_toggle() {
+	local list=$1 wanted=$2 package kept=
+	if ! list_has "$list" "$wanted"; then
+		printf '%s' "${list:+$list }$wanted"
 		return
 	fi
-	for package in $ADDITIONAL_PACKAGES; do
+	for package in $list; do
 		[ "$package" = "$wanted" ] || kept="${kept:+$kept }$package"
 	done
-	ADDITIONAL_PACKAGES=$kept
+	printf '%s' "$kept"
+}
+
+package_selected() { list_has "$ADDITIONAL_PACKAGES" "$1"; }
+package_toggle() { ADDITIONAL_PACKAGES=$(list_toggle "$ADDITIONAL_PACKAGES" "$1"); }
+
+neko_selected() { list_has "$NEKO_PACKAGES" "$1"; }
+neko_toggle() { NEKO_PACKAGES=$(list_toggle "$NEKO_PACKAGES" "$1"); }
+
+# The packages NekoAwai writes itself, rather than takes from the
+# distribution. Name, the profile it suits, and the line the screen shows.
+neko_package_table() {
+	cat <<-'EOF'
+		nekowall	desktop	Wallpapers drawn to the exact size of the screen.
+		nekofetch	any	The system summary a fresh machine is asked for.
+	EOF
+}
+
+# nekowall is a window: on a console system it would bring Qt along for
+# nothing, so it is not offered there.
+neko_offered() {
+	local wanted=$1 name profile
+	while IFS=$'\t' read -r name profile _; do
+		[ "$name" = "$wanted" ] || continue
+		[ "$profile" = any ] || [ "$profile" = "$PROFILE" ]
+		return
+	done < <(neko_package_table)
+	return 1
+}
+
+# What is both wanted and suited to the profile. A desktop package left
+# selected while the profile is minimal stays selected -- switching the
+# profile back must not lose the answer -- it simply is not installed.
+neko_install_list() {
+	local name out=
+	while IFS=$'\t' read -r name _; do
+		neko_offered "$name" || continue
+		neko_selected "$name" || continue
+		out="${out:+$out }$name"
+	done < <(neko_package_table)
+	printf '%s' "$out"
+}
+
+# The same list as a line for a person to read.
+neko_install_list_text() {
+	local ours
+	ours=$(neko_install_list)
+	[ -n "$ours" ] || { printf 'none'; return; }
+	printf '%s' "${ours// /, }"
+}
+
+# The ones a pattern would bring in anyway. They are recommended rather than
+# required, and a recommendation is taken up unless something says otherwise.
+neko_refused_list() {
+	local name out=
+	while IFS=$'\t' read -r name _; do
+		neko_offered "$name" || continue
+		neko_selected "$name" || out="${out:+$out }$name"
+	done < <(neko_package_table)
+	printf '%s' "$out"
+}
+
+# Both lists on one line, ours first: they are on by default, and a row that
+# said "none" while installing two of them would be a lie.
+packages_row() {
+	local ours extra=${ADDITIONAL_PACKAGES:-}
+	ours=$(neko_install_list)
+	if [ -n "$ours" ] && [ -n "$extra" ]; then
+		printf '%s + %s' "${ours// /, }" "${extra// /, }"
+	elif [ -n "$ours" ]; then
+		printf '%s' "${ours// /, }"
+	else
+		printf '%s' "${extra:-none}"
+	fi
 }
 
 package_available() {
@@ -674,6 +813,13 @@ validate_configuration() {
 			package_available "$package" ||
 				problem "Package not found in the repositories: $package"
 		done
+		# Ours come from the medium, not from upstream. A medium without
+		# them is worth saying so before the disk is erased rather than
+		# in the middle of the package step.
+		for package in $(neko_install_list); do
+			package_available "$package" ||
+				problem "NekoAwai package not on this medium: $package"
+		done
 	fi
 
 	[ -z "$VALIDATION_ERROR" ]
@@ -730,7 +876,7 @@ configure_tui() {
 			[users]="Everyday accounts, and what happens to root."
 			[ssh]="Whether sshd listens after the first boot. Needs a user in wheel."
 			[network]="How the installed system gets back on the network."
-			[packages]="Anything to install along with the profile."
+			[packages]="Our own packages, and anything else to install along with the profile."
 			[install]="Shows the whole configuration first. The disk survives until you confirm."
 			[quit]="Leaves every disk as it is."
 		)
@@ -743,7 +889,7 @@ configure_tui() {
 			users "$(tui_row Users "${#USER_NAMES[@]}, root $(root_state)")" \
 			network "$(tui_row Network "$NETWORK_MODE")" \
 			ssh "$(tui_row SSH "$ENABLE_SSH")" \
-			packages "$(tui_row Packages "${ADDITIONAL_PACKAGES:-none}")" \
+			packages "$(tui_row Packages "$(packages_row)")" \
 			install "Install" \
 			quit "Quit"; then
 			die "installation cancelled"
@@ -907,9 +1053,10 @@ normalize_gpu_packages() {
 install_base() {
 	log "installing the base system"
 	local pattern=patterns-nekoawai-base
-	local -a install_args=()
+	local -a install_args=() refused=()
 	[ "$PROFILE" != desktop ] || pattern="patterns-nekoawai-$DESKTOP"
-	read -r -a install_args <<< "$ADDITIONAL_PACKAGES $GPU_PACKAGES"
+	read -r -a install_args <<< "$(neko_install_list) $ADDITIONAL_PACKAGES $GPU_PACKAGES"
+	read -r -a refused <<< "$(neko_refused_list)"
 	# Bootstrap repositories exist for the duration of the install only; in
 	# the finished system repositories belong to nekoawai-repos.
 	zypper --root "$TARGET" --non-interactive --gpg-auto-import-keys \
@@ -919,12 +1066,24 @@ install_base() {
 			addrepo --no-gpgcheck --priority 90 "dir:$NEKO_TARGET_REPO" nekoawai-local
 	fi
 
+	# A package of ours that was marked off is recommended by the desktop
+	# pattern all the same, and a recommendation is taken up unless
+	# something says otherwise. The lock is that something, and it is lifted
+	# again below: the answer was given once, it is not a ban on the
+	# finished system.
+	if [ "${#refused[@]}" -gt 0 ]; then
+		zypper --root "$TARGET" --non-interactive addlock "${refused[@]}"
+	fi
+
 	if [ "$PROFILE" = desktop ]; then
 		zypper --root "$TARGET" --non-interactive --gpg-auto-import-keys \
 			install "$pattern" "${install_args[@]}"
 	else
 		zypper --root "$TARGET" --non-interactive --gpg-auto-import-keys \
 			install --no-recommends "$pattern" "${install_args[@]}"
+	fi
+	if [ "${#refused[@]}" -gt 0 ]; then
+		zypper --root "$TARGET" --non-interactive removelock "${refused[@]}"
 	fi
 	normalize_gpu_packages
 
@@ -1135,6 +1294,7 @@ save_install_profile() {
 		printf 'HOSTNAME=%q\n' "$HOSTNAME"
 		printf 'NETWORK_MODE=%q\n' "$NETWORK_MODE"
 		printf 'ENABLE_SSH=%q\n' "$ENABLE_SSH"
+		printf 'NEKO_PACKAGES=%q\n' "$(neko_install_list)"
 		printf 'USERS=%q\n' "$users"
 	} > "$TARGET/etc/nekoawai/install.conf"
 	chmod 0600 "$TARGET/etc/nekoawai/install.conf"
