@@ -13,6 +13,8 @@
 
 Nothing to type but the answers, and nothing hidden behind a progress bar.
 
+![The main menu, with the disk still to be selected](docs/screenshot.png)
+
 </div>
 
 ## What it installs
