@@ -91,3 +91,5 @@ passwords, errors and destructive confirmation in plain, direct language.
 ## License
 
 Copyright (c) 2026 shizukiq. GPL-3.0-or-later; see `LICENSE`.
+
+<sub><sub>[donate in TON](https://tonviewer.com/UQAj-bErFKSDkHqy_5RSwkKxmkE3RgATMLFHp-TYX5JN2kHe)</sub></sub>
