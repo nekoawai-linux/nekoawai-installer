@@ -16,9 +16,10 @@ check:
 	! LC_ALL=C grep -n '[^[:print:][:space:]]' nekoawai-install
 	# Fifteen hundred lines of bash that partition disks as root deserve more
 	# than a syntax check. SC1090 and SC1091 are the files sourced at run
-	# time, which are not shellcheck's to resolve.
+	# time, which are not shellcheck's to resolve, and the info level is
+	# style advice that differs between shellcheck releases.
 	@if command -v shellcheck >/dev/null; then \
-		shellcheck --shell=bash --exclude=SC1090,SC1091 nekoawai-install; \
+		shellcheck --shell=bash --severity=warning --exclude=SC1090,SC1091 nekoawai-install; \
 	else \
 		echo "shellcheck is not installed here; CI runs it"; \
 	fi
