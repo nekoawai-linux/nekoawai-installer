@@ -15,13 +15,28 @@ export LC_ALL=C.UTF-8
 
 TARGET=/mnt
 ESP_SIZE=512MiB
-VERSION=0.4.0
+VERSION=0.5.0
 INSTALL_LOG=/tmp/nekoawai-install.log
+
+# Room the profile needs before the disk is erased rather than eight minutes
+# into the package step. The base unpacks to about 2 GiB and the largest
+# desktop to something under 8; these are floors, below which the install
+# cannot finish, not recommendations.
+MIN_DISK_MINIMAL_GIB=6
+MIN_DISK_DESKTOP_GIB=12
 
 # Where the nekoawai-* packages live on the installation medium. Until
 # there is a public build, they come from here.
 : "${NEKO_TARGET_REPO:=${NEKO_LOCAL_REPO:-/run/nekoawai/repo}}"
-: "${NEKO_CORE_REPO:=http://download.opensuse.org/tumbleweed/repo/oss/}"
+# https, and no --gpg-auto-import-keys anywhere below. A signature is worth
+# exactly the key it is checked against: importing whatever the network
+# offers and then verifying against it proves that the packets agree with
+# themselves and nothing else.
+: "${NEKO_CORE_REPO:=https://download.opensuse.org/tumbleweed/repo/oss/}"
+# The keys the medium was built with, put there by openSUSE-build-key. They
+# travel with the installer instead of arriving beside the packages they are
+# meant to vouch for.
+: "${NEKO_KEYS_DIR:=/usr/lib/rpm/gnupg/keys}"
 : "${NEKO_DETECT_GPU:=yes}"
 # The Live system carries packages, not a package list, and no repository of
 # its own. Package search needs one, so it gets a root to keep it in; on the
@@ -30,6 +45,7 @@ INSTALL_LOG=/tmp/nekoawai-install.log
 
 DISK=
 DISK_LABEL=
+BOOT_MEDIUM=
 ESP_PART=
 ROOT_PART=
 ROOT_DEV=
@@ -41,6 +57,7 @@ ENCRYPT=no
 HOSTNAME=
 LOCALE=
 KEYMAP=
+KEYMAP_LOADED=no
 TIMEZONE=
 PROFILE=minimal
 DESKTOP=
@@ -58,6 +75,7 @@ ROOT_PASSWORD=
 LUKS_PASSPHRASE=
 TUI=no
 GPU_PACKAGES=
+FIRMWARE_PACKAGES=
 STEP_INDEX=0
 STEP_TOTAL=0
 
@@ -225,14 +243,62 @@ tui_password() {
 	done
 }
 
+# The disk the Live system itself came from. lsblk offers it in the list
+# beside the machine's own disks with nothing to tell them apart, and erasing
+# it halfway through an install takes the installer down with it.
+# dracut-kiwi-live keeps the medium mounted under /run/initramfs; whatever
+# holds it, lsblk names the whole disk that partition belongs to.
+boot_medium_disk() {
+	local mount source parent
+	for mount in /run/initramfs/isoscan /run/initramfs/live /run/initramfs/source; do
+		[ -d "$mount" ] || continue
+		source=$(findmnt -no SOURCE --target "$mount" 2>/dev/null) || continue
+		[ -b "$source" ] || continue
+		parent=$(lsblk -no PKNAME "$source" 2>/dev/null | head -n 1)
+		printf '%s' "${parent:+/dev/$parent}"
+		[ -n "$parent" ] || printf '%s' "$source"
+		return 0
+	done
+}
+
+disk_size_gib() {
+	local bytes
+	bytes=$(blockdev --getsize64 "$1" 2>/dev/null) || return 1
+	printf '%s' $(( bytes / 1024 / 1024 / 1024 ))
+}
+
+# What can actually hold a system. lsblk lists a good deal more: the empty
+# floppy drive a hypervisor invents out of nothing, the Live system's own
+# compressed swap, ram disks, loop devices and the optical drive -- and the
+# medium this installer booted from. A list is a set of things somebody is
+# invited to pick from, so anything that must never be picked has no business
+# on it, whatever the checks afterwards would have said.
+installable_disks() {
+	local line device
+	while IFS= read -r line; do
+		device=${line%% *}
+		case ${device##*/} in zram* | ram* | fd*) continue ;; esac
+		[ -z "$BOOT_MEDIUM" ] || [ "$device" != "$BOOT_MEDIUM" ] || continue
+		printf '%s\n' "$line"
+	done < <(lsblk -dnpo NAME,SIZE,MODEL -e 1,2,7,11)
+}
+
 select_disk_tui() {
 	local line size model
 	local -a items=()
 	while IFS= read -r line; do
 		items+=("${line%% *}" "$line")
-	done < <(lsblk -dnpo NAME,SIZE,MODEL -e 7,11)
+	done < <(installable_disks)
 
-	[ "${#items[@]}" -gt 0 ] || { tui_message "No installation disks found."; return; }
+	if [ "${#items[@]}" -eq 0 ]; then
+		if [ -n "$BOOT_MEDIUM" ]; then
+			tui_message "The only disk in this machine is $BOOT_MEDIUM, which is
+the medium the installer booted from. It is not offered."
+		else
+			tui_message "No installation disks found."
+		fi
+		return
+	fi
 	if tui_menu "Select a disk. It is erased only after the confirmation." \
 		"${items[@]}"; then
 		DISK=$REPLY
@@ -314,10 +380,57 @@ select_swap_tui() {
 	fi
 }
 
+# The keymap has to reach the console the moment it is chosen, not only the
+# system being installed: every password typed after this point is typed on
+# it, and a password entered under one layout and stored as another is not
+# the password anybody thinks it is. Nothing shows that until the first
+# login, which is the one moment there is nothing left to fix it with.
+#
+# loadkeys is no use for checking a name: it wants a console before it will
+# even parse, so on anything without one it rejects every keymap there is.
+# localectl asks systemd, which is running on the Live system; where it is
+# not, the keymap files answer for themselves.
+keymap_exists() {
+	local wanted=$1
+	localectl list-keymaps 2>/dev/null | grep -qxF -- "$wanted" && return 0
+	[ -n "$(find /usr/share/kbd/keymaps -name "$wanted.map*" -print -quit 2>/dev/null)" ]
+}
+
+set_keymap() {
+	local wanted=$1
+	keymap_exists "$wanted" || return 1
+	KEYMAP=$wanted
+	KEYMAP_LOADED=no
+	# Loaded only where this process owns a console. Driven from a pipe --
+	# which is how scripts/test-install.sh runs it -- there is none of ours,
+	# and the one the developer is sitting at is not the installer's to
+	# change. Either way the choice still reaches the installed system.
+	if [ -t 0 ] && loadkeys --quiet -- "$wanted" >/dev/null 2>&1; then
+		KEYMAP_LOADED=yes
+	fi
+}
+
+passwords_entered() {
+	[ -n "$ROOT_PASSWORD" ] || [ -n "$LUKS_PASSPHRASE" ] || [ "${#USER_PASSWORDS[@]}" -gt 0 ]
+}
+
 configure_identity_tui() {
 	if tui_input "Machine name" "Hostname" "${HOSTNAME:-nekoawai}"; then HOSTNAME=$REPLY; fi
 	if tui_input "Locale" "System locale" "${LOCALE:-en_US.UTF-8}"; then LOCALE=$REPLY; fi
-	if tui_input "Keyboard" "Console keymap" "${KEYMAP:-us}"; then KEYMAP=$REPLY; fi
+	if tui_input "Keyboard" "Console keymap" "${KEYMAP:-us}" && [ "$REPLY" != "$KEYMAP" ]; then
+		if ! set_keymap "$REPLY"; then
+			tui_message "There is no keymap called $REPLY, so the console stays on $KEYMAP.
+localectl list-keymaps names the ones this medium carries."
+		elif [ "$KEYMAP_LOADED" != yes ]; then
+			tui_message "The installed system will use $KEYMAP, but this console could not be
+switched over to it. Until the first boot, type on the layout the keyboard
+in front of you actually has."
+		elif passwords_entered; then
+			tui_message "The keyboard is $KEYMAP from now on.
+What was typed before this was typed on the old layout: enter the passwords
+again, or they will not be the passwords you think they are."
+		fi
+	fi
 	if tui_input "Time zone" "Timezone, for example Europe/Samara" "${TIMEZONE:-UTC}"; then TIMEZONE=$REPLY; fi
 }
 
@@ -607,6 +720,26 @@ configuration_summary() {
 	EOF
 }
 
+# The keys a package is checked against, put into the root that is about to
+# check them. They come off the medium -- openSUSE-build-key is in the base
+# pattern, so the Live system carries them -- and never from beside the
+# packages they are meant to vouch for. That is the whole difference between
+# a signature and a decoration, and it is why no zypper call anywhere here is
+# given --gpg-auto-import-keys.
+import_upstream_keys() {
+	local root=$1 key
+	local -a keys=()
+	for key in "$NEKO_KEYS_DIR"/*.asc; do
+		[ -e "$key" ] || break
+		keys+=("$key")
+	done
+	if [ "${#keys[@]}" -eq 0 ]; then
+		echo "no keys in $NEKO_KEYS_DIR: this medium cannot verify what it installs" >&2
+		return 1
+	fi
+	rpm --root "$root" --import "${keys[@]}"
+}
+
 # The Live system has no repositories of its own: the medium carries the
 # packages of the distribution, and everything else is fetched during the
 # install. So searching means keeping a package list somewhere, and it goes
@@ -621,14 +754,18 @@ package_index() {
 	[ "$TUI" != yes ] || tui_screen "Fetching the package list. This happens once and needs the network."
 	install -dm 0755 "$NEKO_INDEX_ROOT"
 	{
-		zypper --root "$NEKO_INDEX_ROOT" --non-interactive --gpg-auto-import-keys \
+		import_upstream_keys "$NEKO_INDEX_ROOT" &&
+		zypper --root "$NEKO_INDEX_ROOT" --non-interactive \
 			addrepo --refresh "$NEKO_CORE_REPO" nekoawai-index &&
 		if [ -d "$NEKO_TARGET_REPO" ]; then
+			# Ours are unsigned until there is a key; see nekoawai-keyring.
+			# They also never left the medium, which is the only reason this
+			# is not the same compromise as the line above would have been.
 			zypper --root "$NEKO_INDEX_ROOT" --non-interactive \
 				addrepo --no-gpgcheck --priority 90 \
 				"dir:$NEKO_TARGET_REPO" nekoawai-index-local
 		fi &&
-		zypper --root "$NEKO_INDEX_ROOT" --non-interactive --gpg-auto-import-keys refresh
+		zypper --root "$NEKO_INDEX_ROOT" --non-interactive refresh
 	} >> "$INSTALL_LOG" 2>&1 && return 0
 
 	# A half-built index would be taken for a finished one on the next call.
@@ -765,12 +902,23 @@ problem() { [ -n "$VALIDATION_ERROR" ] || VALIDATION_ERROR=$1; }
 validate_configuration() {
 	local depth=${1:-local} name package has_admin=no
 	local profile_package=patterns-nekoawai-base
+	local needed=$MIN_DISK_MINIMAL_GIB size
 	VALIDATION_ERROR=
 	[ -n "$DISK" ] && [ -b "$DISK" ] || problem "Select an installation disk."
 	# Quiet: the menu runs these checks on every redraw, and a disk that has
 	# been unplugged must not write over the screen.
 	if [ -n "$DISK" ] && lsblk -nrpo MOUNTPOINT "$DISK" 2>/dev/null | grep -q '[^[:space:]]'; then
 		problem "There are mounted filesystems on $DISK."
+	fi
+	[ -z "$BOOT_MEDIUM" ] || [ "$DISK" != "$BOOT_MEDIUM" ] ||
+		problem "$DISK is the medium this installer booted from."
+	# Room enough to finish. Found here, where the answer is a different disk,
+	# rather than eight minutes into the package step with the old system
+	# already gone.
+	[ "$PROFILE" != desktop ] || needed=$MIN_DISK_DESKTOP_GIB
+	if [ -n "$DISK" ] && [ -b "$DISK" ] && size=$(disk_size_gib "$DISK"); then
+		[ "$size" -ge "$needed" ] ||
+			problem "$DISK holds $size GiB; a ${DESKTOP:-$PROFILE} system needs $needed."
 	fi
 	case $FSTYPE in
 	ext4 | btrfs) ;;
@@ -924,21 +1072,27 @@ partition_path() {
 
 require_uefi_root() {
 	[ "$(id -u)" -eq 0 ] || die "root privileges are required"
-	[ -d /sys/firmware/efi ] || die "0.0.1 installs on UEFI machines only"
+	[ -d /sys/firmware/efi ] ||
+		die "this machine did not boot through UEFI, and NekoAwai installs on UEFI only"
 }
 
 select_disk() {
 	log "available disks"
-	lsblk -dno NAME,SIZE,MODEL -e 7,11
-	DISK=/dev/$(ask "disk to install on (without /dev/)")
+	installable_disks
+	DISK=$(ask "disk to install on")
+	# The list prints full paths; a bare name is what gets typed, and what
+	# scripts/test-install.sh has been passing since this path existed.
+	case $DISK in /*) ;; *) DISK=/dev/$DISK ;; esac
 	[ -b "$DISK" ] || die "$DISK is not a block device"
+	[ -z "$BOOT_MEDIUM" ] || [ "$DISK" != "$BOOT_MEDIUM" ] ||
+		die "$DISK is the medium this installer booted from"
 }
 
 select_layout() {
 	FSTYPE=$(ask "root filesystem (ext4/btrfs)" ext4)
 	case $FSTYPE in
 	ext4 | btrfs) ;;
-	*) die "0.0.1 supports ext4 and btrfs only" ;;
+	*) die "the root filesystem is ext4 or btrfs" ;;
 	esac
 	ENCRYPT=$(ask "encrypt the root with LUKS2 (yes/no)" no)
 }
@@ -996,7 +1150,11 @@ mount_target() {
 		mount "$ROOT_DEV" "$TARGET"
 		btrfs subvolume create "$TARGET/@" >/dev/null
 		umount "$TARGET"
-		mount -o subvol=@ "$ROOT_DEV" "$TARGET"
+		# Compressed from here on, not from the first boot: btrfs compresses
+		# on write and never goes back over what is already down, so a base
+		# unpacked through an uncompressed mount stays uncompressed for the
+		# life of the system.
+		mount -o subvol=@,compress=zstd:1 "$ROOT_DEV" "$TARGET"
 	else
 		mount "$ROOT_DEV" "$TARGET"
 	fi
@@ -1030,6 +1188,18 @@ detect_gpu_packages() {
 	GPU_PACKAGES=${GPU_PACKAGES% }
 }
 
+# The firmware set is recommended by the base pattern rather than required,
+# because under a hypervisor not one file of it is ever read and it is the
+# largest single thing in the base. Which of the two cases this is gets
+# decided here, once, and then said outright: the package named on real
+# hardware, a lock under a hypervisor. Neither leaves it to the solver.
+detect_firmware_packages() {
+	local virt
+	virt=$(systemd-detect-virt || :)
+	FIRMWARE_PACKAGES=kernel-firmware-all
+	[ "$virt" = none ] || FIRMWARE_PACKAGES=
+}
+
 normalize_gpu_packages() {
 	local package
 	local selected=" $GPU_PACKAGES "
@@ -1053,15 +1223,24 @@ normalize_gpu_packages() {
 install_base() {
 	log "installing the base system"
 	local pattern=patterns-nekoawai-base
-	local -a install_args=() refused=()
+	local -a install_args=() locked=()
 	[ "$PROFILE" != desktop ] || pattern="patterns-nekoawai-$DESKTOP"
-	read -r -a install_args <<< "$(neko_install_list) $ADDITIONAL_PACKAGES $GPU_PACKAGES"
-	read -r -a refused <<< "$(neko_refused_list)"
+	read -r -a install_args <<< \
+		"$(neko_install_list) $ADDITIONAL_PACKAGES $GPU_PACKAGES $FIRMWARE_PACKAGES"
+	read -r -a locked <<< "$(neko_refused_list)"
+	# Under a hypervisor the firmware set is recommended by the pattern and
+	# wanted by nobody. A lock is what keeps a recommendation from being
+	# taken up, and it comes off again with the rest below.
+	[ -n "$FIRMWARE_PACKAGES" ] || locked+=(kernel-firmware-all)
+
+	import_upstream_keys "$TARGET"
 	# Bootstrap repositories exist for the duration of the install only; in
 	# the finished system repositories belong to nekoawai-repos.
-	zypper --root "$TARGET" --non-interactive --gpg-auto-import-keys \
+	zypper --root "$TARGET" --non-interactive \
 		addrepo --refresh "$NEKO_CORE_REPO" nekoawai-bootstrap
 	if [ -d "$NEKO_TARGET_REPO" ]; then
+		# Unsigned, and off the medium rather than off a network; see
+		# nekoawai-keyring for what closes this.
 		zypper --root "$TARGET" --non-interactive \
 			addrepo --no-gpgcheck --priority 90 "dir:$NEKO_TARGET_REPO" nekoawai-local
 	fi
@@ -1071,19 +1250,19 @@ install_base() {
 	# something says otherwise. The lock is that something, and it is lifted
 	# again below: the answer was given once, it is not a ban on the
 	# finished system.
-	if [ "${#refused[@]}" -gt 0 ]; then
-		zypper --root "$TARGET" --non-interactive addlock "${refused[@]}"
+	if [ "${#locked[@]}" -gt 0 ]; then
+		zypper --root "$TARGET" --non-interactive addlock "${locked[@]}"
 	fi
 
 	if [ "$PROFILE" = desktop ]; then
-		zypper --root "$TARGET" --non-interactive --gpg-auto-import-keys \
+		zypper --root "$TARGET" --non-interactive \
 			install "$pattern" "${install_args[@]}"
 	else
-		zypper --root "$TARGET" --non-interactive --gpg-auto-import-keys \
+		zypper --root "$TARGET" --non-interactive \
 			install --no-recommends "$pattern" "${install_args[@]}"
 	fi
-	if [ "${#refused[@]}" -gt 0 ]; then
-		zypper --root "$TARGET" --non-interactive removelock "${refused[@]}"
+	if [ "${#locked[@]}" -gt 0 ]; then
+		zypper --root "$TARGET" --non-interactive removelock "${locked[@]}"
 	fi
 	normalize_gpu_packages
 
@@ -1146,7 +1325,11 @@ bind_system_mounts() {
 write_fstab() {
 	log "fstab"
 	local root_options=defaults
-	[ "$FSTYPE" = btrfs ] && root_options=subvol=@
+	# zstd:1 compresses text, source and package caches for nothing and gets
+	# out of the way of everything already compressed. The storage screen
+	# offers btrfs as "subvolumes, compression and snapshots later on", and
+	# until now it delivered the first word of the three.
+	[ "$FSTYPE" = btrfs ] && root_options=subvol=@,compress=zstd:1
 
 	cat > "$TARGET/etc/fstab" <<-EOF
 		UUID=$ROOT_UUID  /          $FSTYPE  $root_options  0 1
@@ -1196,15 +1379,65 @@ configure_network() {
 	find "$TARGET$source" -type f -exec chmod 0600 {} +
 }
 
+# systemd-firstboot writes vconsole.conf and stops there, which is the text
+# console and nothing else: every graphical profile would come up in the
+# layout its packages were built with, whatever was chosen during the
+# install. The console-to-X11 table is systemd's own, so a keymap that
+# carries a second group -- ru brings us along, with a toggle -- arrives
+# with the group and the toggle intact.
+write_x11_keymap() {
+	local map=/usr/share/systemd/kbd-model-map
+	local console layout model variant options
+	local found=no
+
+	if [ -r "$map" ]; then
+		while read -r console layout model variant options _; do
+			case $console in '' | \#*) continue ;; esac
+			[ "$console" = "$KEYMAP" ] || continue
+			[ "$variant" != - ] || variant=
+			[ "$options" != - ] || options=
+			found=yes
+			break
+		done < "$map"
+	fi
+
+	# The table only knows the older console names, and kbd now ships keymaps
+	# generated from xkb itself: their names are the layout and the variant
+	# with a dash between them, which is the whole of what is needed here.
+	if [ "$found" != yes ]; then
+		layout=${KEYMAP%%-*}
+		variant=${KEYMAP#"$layout"}
+		variant=${variant#-}
+		model=pc105
+		options=terminate:ctrl_alt_bksp
+	fi
+
+	install -dm 0755 "$TARGET/etc/X11/xorg.conf.d"
+	cat > "$TARGET/etc/X11/xorg.conf.d/00-keyboard.conf" <<-EOF
+		# Written by nekoawai-install from the console keymap $KEYMAP.
+		Section "InputClass"
+		  Identifier "system-keyboard"
+		  MatchIsKeyboard "on"
+		  Option "XkbLayout" "$layout"
+		  Option "XkbModel" "$model"
+		  Option "XkbVariant" "$variant"
+		  Option "XkbOptions" "$options"
+		EndSection
+	EOF
+}
+
 configure_system() {
 	log "system configuration"
 	local index password_hash groups
 	if [ "$TUI" != yes ]; then
 		LOCALE=$(ask "locale" en_US.UTF-8)
-		# Ask for the keymap before any password: under the wrong layout the
-		# password typed is not the one intended, and that only surfaces at the
-		# first login.
-		KEYMAP=$(ask "console keymap" us)
+		# Ask for the keymap before any password, and load it here rather
+		# than only writing it into the target: under the wrong layout the
+		# password typed is not the one stored, and that only surfaces at
+		# the first login.
+		until set_keymap "$(ask "console keymap" us)"; do
+			echo "no keymap of that name; localectl list-keymaps has the list" >&2
+		done
 		TIMEZONE=$(ask "time zone" UTC)
 		HOSTNAME=$(ask "machine name" nekoawai)
 		ROOT_PASSWORD=$(ask_secret "root password")
@@ -1213,6 +1446,7 @@ configure_system() {
 	systemd-firstboot --root="$TARGET" --force \
 		--locale="$LOCALE" --timezone="$TIMEZONE" --hostname="$HOSTNAME" \
 		--keymap="$KEYMAP"
+	write_x11_keymap
 
 	# Set the password as a hash through usermod rather than chpasswd:
 	# chpasswd and passwd are labelled passwd_exec_t, and on a SELinux
@@ -1259,7 +1493,10 @@ install_bootloader() {
 		efi_flags=--no-variables
 
 	options="root=UUID=$ROOT_UUID rw quiet loglevel=3"
-	[ "$FSTYPE" = btrfs ] && options="$options rootflags=subvol=@"
+	# The same options fstab uses: the root is mounted from here first, and a
+	# root mounted uncompressed and remounted compressed keeps whatever was
+	# written in between uncompressed.
+	[ "$FSTYPE" = btrfs ] && options="$options rootflags=subvol=@,compress=zstd:1"
 	[ "$ENCRYPT" = yes ] && options="rd.luks.uuid=$ROOT_PART_UUID $options"
 
 	# The kernel package scriptlet reads the command line from here on every
@@ -1349,7 +1586,18 @@ installation_failed() {
 	# tee, and the one line that must not be lost to its buffer is this one.
 	printf '\n%sStep %s of %s failed: %s%s\n' \
 		"$TUI_WARN" "$STEP_INDEX" "$STEP_TOTAL" "${CURRENT_STEP:-unknown}" "$TUI_PLAIN" >&3
-	printf 'Nothing further was written. The whole run is in %s\n' "$INSTALL_LOG" >&3
+	# What is on the disk, said plainly. The first step is the one that
+	# erases it, so from there on there is no version of this message that
+	# can promise the old contents are still there. An installer that says
+	# "nothing was written" at step fourteen of fifteen tells the one lie
+	# that costs somebody their data.
+	if [ "$STEP_INDEX" -eq 0 ]; then
+		printf 'No disk was touched.\n' >&3
+	else
+		printf '%s was erased at step 1 and holds an unfinished system. There is\nnothing on it to go back to; installing again is the way out.\n' \
+			"$DISK" >&3
+	fi
+	printf 'The whole run is in %s\n' "$INSTALL_LOG" >&3
 	exit "$status"
 }
 
@@ -1378,6 +1626,7 @@ main() {
 
 	require_uefi_root
 	exec 3>&2
+	BOOT_MEDIUM=$(boot_medium_disk)
 	if [ "$force_text" = no ] && [ -t 0 ] && [ -t 1 ]; then
 		TUI=yes
 		configure_tui
@@ -1391,6 +1640,7 @@ main() {
 	trap installation_failed ERR
 	: > "$INSTALL_LOG"
 	detect_gpu_packages
+	detect_firmware_packages
 	started=$SECONDS
 
 	if [ "$TUI" = yes ]; then
@@ -1402,23 +1652,30 @@ Everything below also goes to $INSTALL_LOG"
 		exec > >(tee -a "$INSTALL_LOG") 2>&1
 	fi
 
-	# Keep in step with the run_step calls below.
-	STEP_TOTAL=15
-	run_step "Partitioning $DISK" partition_disk
-	run_step "Setting up LUKS2" open_encrypted_root
-	run_step "Creating filesystems" format_filesystems
-	run_step "Mounting the target" mount_target
-	run_step "Installing packages" install_base
-	run_step "Binding /proc, /sys, /dev and /run" bind_system_mounts
-	run_step "Keeping the NekoAwai repository" keep_own_packages
-	run_step "Applying the systemd policy" apply_service_policy
-	run_step "Writing fstab" write_fstab
-	run_step "Setting up swap" configure_swap
-	run_step "Configuring the system and users" configure_system
-	run_step "Configuring the network" configure_network
-	run_step "Building the initramfs" build_initramfs
-	run_step "Installing systemd-boot" install_bootloader
-	run_step "Saving the installation profile" save_install_profile
+	# The plan is the count: a step added here cannot leave the numbering on
+	# screen behind, which a hand-kept total did every time one was.
+	local -a plan=(
+		"Partitioning $DISK"                partition_disk
+		"Setting up LUKS2"                  open_encrypted_root
+		"Creating filesystems"              format_filesystems
+		"Mounting the target"               mount_target
+		"Installing packages"               install_base
+		"Binding /proc, /sys, /dev and /run" bind_system_mounts
+		"Keeping the NekoAwai repository"   keep_own_packages
+		"Applying the systemd policy"       apply_service_policy
+		"Writing fstab"                     write_fstab
+		"Setting up swap"                   configure_swap
+		"Configuring the system and users"  configure_system
+		"Configuring the network"           configure_network
+		"Building the initramfs"            build_initramfs
+		"Installing systemd-boot"           install_bootloader
+		"Saving the installation profile"   save_install_profile
+	)
+	STEP_TOTAL=$(( ${#plan[@]} / 2 ))
+	local step
+	for (( step = 0; step < ${#plan[@]}; step += 2 )); do
+		run_step "${plan[step]}" "${plan[step + 1]}"
+	done
 
 	trap - ERR
 	trap - EXIT

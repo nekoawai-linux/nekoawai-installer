@@ -21,7 +21,7 @@ Nothing to type but the answers, and nothing hidden behind a progress bar.
 
 - UEFI with systemd-boot
 - whole-disk GPT layout, a 512 MiB ESP and one root partition
-- ext4 or btrfs, with an `@` subvolume on btrfs
+- ext4 or btrfs, with an `@` subvolume and `compress=zstd:1` on btrfs
 - optional LUKS2 on the root
 - zram, a swap file, or no swap
 - Minimal, or one of Niri, Hyprland, GNOME, Plasma and Xfce
@@ -53,7 +53,22 @@ install. The package list is fetched once, on the first search, into
 carries packages, not an index, so there is nothing to search until then.
 
 The disk is destroyed only after a complete summary and a second confirmation
-that names the disk. Nothing is written before that.
+that names the disk. Nothing is written before that. The list offers only what
+can hold a system: the medium the installer booted from is left out, along
+with the Live system's own compressed swap, ram and loop devices, the optical
+drive and the empty floppy a hypervisor invents out of nothing. A disk too
+small for the chosen profile is refused while the answer is still a different
+disk, rather than eight minutes into the package step.
+
+Choosing a console keymap loads it there and then. Every password typed after
+that point is typed on it, and one entered under the wrong layout is not the
+password that gets stored -- which shows up at the first login, the one moment
+there is nothing left to fix it with. The same choice is written into the
+installed system for graphical sessions as well as for the text console.
+
+Signatures are checked against the keys the medium carries. Nothing imports a
+key from the network it is then used to vouch for, so upstream packages are
+verified or the install stops.
 
 Everything the installer runs is shown on screen and copied to
 `/tmp/nekoawai-install.log`. All screens are English, and the installer runs
@@ -69,7 +84,7 @@ searchable package list is kept in `NEKO_INDEX_ROOT`.
 
 ## Packaging
 
-    make check                          syntax, ASCII-only screens, --version
+    make check                          syntax, shellcheck, ASCII screens, --version
     make install DESTDIR=/tmp/root      install into a packaging root
     make dist                           reproducible release archive
 

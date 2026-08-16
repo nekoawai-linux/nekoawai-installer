@@ -15,11 +15,16 @@ concurrency:
 
 jobs:
   check:
-    name: syntax, ASCII screens, version
+    name: shellcheck, ASCII screens, version
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Shell analysis
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck
 
       - name: make check
         run: make check
